@@ -1,12 +1,15 @@
 const TelegramBot = require('node-telegram-bot-api');
-const config = require('./config');
+const { TELEGRAM_BOT_TOKEN, TELEGRAM_USER_IDS, TIMEZONE } = require('./config');
+const dayjs = require('dayjs');
+require('dayjs/locale/vi');
+dayjs.locale('vi');
 
-const bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+console.log('🤖 Cofure bot đã khởi động!');
 
-// Log lỗi nếu có
-bot.on('polling_error', console.log);
+global.bot = bot;
+global.USER_IDS = TELEGRAM_USER_IDS;
 
-// Phản hồi khi người dùng nhắn /start
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, `🤖 Bot Cofure đã sẵn sàng hoạt động!`);
-});
+require('./web');
+
+// Tạm thời chưa load tasks vì bạn chưa tạo thư mục `tasks/`
