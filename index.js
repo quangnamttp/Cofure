@@ -4,6 +4,8 @@ const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const timezone = require('dayjs/plugin/timezone');
 require('dayjs/locale/vi');
+const schedule = require('node-schedule');
+const sendMorningReport = require('./tasks/morningReport')
 
 // Cấu hình múi giờ
 dayjs.locale('vi');
@@ -34,4 +36,9 @@ bot.onText(/\/start/, (msg) => {
   } else {
     bot.sendMessage(chatId, `🚫 Bạn không có quyền sử dụng bot này.`);
   }
+});
+
+// Lên lịch chạy lúc 06:00 mỗi ngày
+schedule.scheduleJob('0 6 * * *', () => {
+  sendMorningReport();
 });
