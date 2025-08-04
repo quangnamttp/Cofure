@@ -1,7 +1,7 @@
 // config.js
 module.exports = {
   TELEGRAM_BOT_TOKEN: '8046421418:AAEAFt3dBzScgeFrNxdYrikyZxLOLD8kcIY',  
-  TELEGRAM_USER_IDS: ['123456789'],                  // ← Telegram user ID của bạn (sẽ hướng dẫn cách lấy)
+  TELEGRAM_USER_IDS: ['5335165612'],                 
   TIMEZONE: 'Asia/Ho_Chi_Minh',
   
   // Bật/tắt từng module nếu cần
