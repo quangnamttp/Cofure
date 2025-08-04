@@ -1,4 +1,3 @@
-// index.js
 const TelegramBot = require('node-telegram-bot-api');
 const { TELEGRAM_BOT_TOKEN, TELEGRAM_USER_IDS, TIMEZONE } = require('./config');
 const dayjs = require('dayjs');
@@ -11,17 +10,19 @@ dayjs.locale('vi');
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-console.log('🤖 Cofure bot đã khởi động!');
+// Tạo bot không dùng polling
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
+bot.setWebHook(`https://cofure.onrender.com/bot${TELEGRAM_BOT_TOKEN}`);
+console.log('🤖 Cofure bot đã khởi động với Webhook!');
 
 // Gán bot và danh sách ID người dùng cho toàn cục
 global.bot = bot;
 global.USER_IDS = TELEGRAM_USER_IDS;
 
-// Load Web Server (dùng để ping giữ bot sống)
+// Load Web Server để Telegram gửi webhook về
 require('./web');
 
-// ⚡ Test phản hồi lệnh /start
+// Xử lý lệnh /start
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id.toString();
