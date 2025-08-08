@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import List
-from cofure.utils.time import now_vn
+from datetime import datetime, timedelta, timezone
+from bs4 import BeautifulSoup
+from cofure.utils.http import client
 
 @dataclass
 class MacroItem:
@@ -9,14 +11,68 @@ class MacroItem:
     impact: str # Low | Medium | High
     note: str | None = None
 
+FF_URL = "https://www.forexfactory.com/calendar?day=today"
+
+IMPACT_MAP = {
+    "Low": "Low", "low": "Low",
+    "Medium": "Medium", "medium": "Medium",
+    "High": "High", "high": "High",
+}
+
+def to_vn_time(hhmm: str) -> str:
+    """Chuyển từ HH:MM GMT -> Asia/Ho_Chi_Minh (+7)."""
+    try:
+        h, m = hhmm.strip().split(":")
+        dt_gmt = datetime.now(timezone.utc).replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+        dt_vn = dt_gmt + timedelta(hours=7)
+        return dt_vn.strftime("%H:%M")
+    except Exception:
+        return hhmm
+
+def _clean_text(x: str) -> str:
+    return " ".join((x or "").split())
+
 async def load_today_items() -> List[MacroItem]:
-    """
-    Chế độ tự động an toàn (không cần API):
-    - Trả về danh sách sự kiện mẫu, ổn định cho 07:00
-    - Bản sau có thể thay bằng nguồn thật khi bạn yêu cầu
-    """
-    # Ví dụ mẫu ổn định (đủ cho format & lịch)
-    return [
-        MacroItem("19:30", "US CPI", "High", "Theo dõi 5–15’ đầu"),
-        MacroItem("21:00", "FOMC Minutes", "High", "Đứng ngoài khi biến động cao"),
-    ]
+    """Lấy lịch hôm nay từ ForexFactory, lọc Medium/High."""
+    try:
+        async with client() as c:
+            r = await c.get(FF_URL)
+            r.raise_for_status()
+            html = r.text
+
+        soup = BeautifulSoup(html, "html.parser")
+        items: List[MacroItem] = []
+
+        for row in soup.select("tr.calendar__row"):
+            time_el = row.select_one(".calendar__time")
+            ev_el = row.select_one(".calendar__event-title, .calendar__event")
+            imp_el = row.select_one(".calendar__impact, .impact")
+            if not (time_el and ev_el and imp_el):
+                continue
+
+            raw_time = _clean_text(time_el.get_text())
+            raw_event = _clean_text(ev_el.get_text())
+            raw_imp = _clean_text(imp_el.get_text()) or _clean_text(imp_el.get("title") or "")
+
+            impact = IMPACT_MAP.get(raw_imp, raw_imp or "Low")
+            if impact not in ("Medium", "High"):
+                continue
+
+            if raw_time and raw_time != "--":
+                hhmm_vn = to_vn_time(raw_time)
+            else:
+                continue
+
+            items.append(MacroItem(time=hhmm_vn, event=raw_event, impact=impact))
+
+        def _to_minutes(t: str) -> int:
+            try:
+                h, m = map(int, t.split(":"))
+                return h * 60 + m
+            except Exception:
+                return 9999
+
+        items.sort(key=lambda x: _to_minutes(x.time))
+        return items
+    except Exception:
+        return []
