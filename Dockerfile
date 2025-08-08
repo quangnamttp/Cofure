@@ -1,4 +1,4 @@
-# Python 3.11 ổn định cho pandas (wheel có sẵn)
+# Python 3.11 ổn định cho pandas
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -11,8 +11,8 @@ RUN pip install --upgrade pip
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# Copy toàn bộ project vào container
+# Copy toàn bộ project
 COPY . .
 
-# Render truyền biến PORT vào container → dùng ${PORT}
-CMD ["bash", "-lc", "uvicorn cofure.app:app --host 0.0.0.0 --port ${PORT}"]
+# Start uvicorn dùng asyncio loop (hợp với app.py mới)
+CMD ["bash", "-lc", "uvicorn cofure.app:app --host 0.0.0.0 --port ${PORT} --loop asyncio"]
