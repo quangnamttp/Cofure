@@ -14,6 +14,10 @@ logging.basicConfig(
 logger = logging.getLogger(APP_NAME)
 
 # -------- AIOHTTP (health endpoints) --------
+async def index(request):
+    # Route "/" - cho UptimeRobot ping domain gốc
+    return web.json_response({"status": "ok", "app": APP_NAME})
+
 async def health(request):
     return web.json_response({"status": "ok", "app": APP_NAME})
 
@@ -22,6 +26,7 @@ async def info(request):
 
 async def _start_aiohttp():
     app = web.Application()
+    app.router.add_get("/", index)          # <-- thêm route "/"
     app.router.add_get("/health", health)
     app.router.add_get("/info", info)
     runner = web.AppRunner(app)
