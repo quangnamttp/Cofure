@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -12,10 +13,12 @@ from cofure.signals.engine import generate_signals_max5
 from cofure.macro.source import load_today_items
 from cofure.macro.advisor import build_prealert, build_onrelease, build_followup
 
-# Scheduler toàn cục (gắn timezone VN)
+log = logging.getLogger("cofure.scheduler")
+
 _SCHED: AsyncIOScheduler | None = None
 
 async def job_morning(bot: Bot):
+    log.info("[06:00] Running morning job…")
     s = get_settings()
     tickers = await futures_24hr()
     top = sorted(
@@ -31,9 +34,10 @@ async def job_morning(bot: Bot):
         f"({fmt_vn()})"
     )
     await bot.send_message(chat_id=s.telegram_chat_id, text=msg)
+    log.info("[06:00] Morning message sent")
 
 async def job_macro(bot: Bot):
-    """07:00 — gửi lịch vĩ mô (chỉ tin High) theo giờ VN."""
+    log.info("[07:00] Running macro calendar job…")
     s = get_settings()
     items = await load_today_items()
     if not items:
@@ -41,25 +45,27 @@ async def job_macro(bot: Bot):
             s.telegram_chat_id,
             "📅 Hôm nay không có tin vĩ mô quan trọng.\nChúc bạn một ngày trade thật thành công nha!"
         )
+        log.info("[07:00] No macro news today")
         return
     lines = [f"📅 Hôm nay {now_vn().strftime('%A, %d/%m/%Y')} (chỉ tin High)"]
     for it in items:
         lines.append(f"• {it.time} — {it.event} — Ảnh hưởng: High")
     lines.append("Gợi ý: Tin mạnh → đứng ngoài 5–15’ sau khi ra tin.")
     await bot.send_message(s.telegram_chat_id, "\n".join(lines))
+    log.info(f"[07:00] Macro calendar sent with {len(items)} events")
 
 async def _schedule_macro_alerts(bot: Bot):
-    """06:55 — đọc lịch hôm nay và tạo job: pre-alert (T-5’), on-release (T), follow-up (T+10’)."""
+    log.info("[06:55] Scheduling macro alerts for today…")
     global _SCHED
     s = get_settings()
     sch = _SCHED
     if sch is None:
+        log.warning("Scheduler not initialized")
         return
     items = await load_today_items()
     now = now_vn()
 
     for it in items:
-        # parse HH:MM VN
         try:
             h, m = map(int, it.time.split(":"))
         except Exception:
@@ -67,28 +73,31 @@ async def _schedule_macro_alerts(bot: Bot):
 
         event_time = now.replace(hour=h, minute=m, second=0, microsecond=0)
         if event_time <= now:
-            continue  # bỏ sự kiện đã qua
+            continue
 
-        # T-5'
         pre_t = event_time - timedelta(minutes=5)
         if pre_t > now:
             sch.add_job(
                 lambda ev=it: asyncio.create_task(bot.send_message(s.telegram_chat_id, build_prealert(ev))),
                 trigger=DateTrigger(run_date=pre_t)
             )
-        # T
+            log.info(f"[06:55] Scheduled pre-alert for {it.event} at {pre_t.strftime('%H:%M')}")
+
         sch.add_job(
             lambda ev=it: asyncio.create_task(bot.send_message(s.telegram_chat_id, build_onrelease(ev))),
             trigger=DateTrigger(run_date=event_time)
         )
-        # T+10'
+        log.info(f"[06:55] Scheduled on-release for {it.event} at {event_time.strftime('%H:%M')}")
+
         fol_t = event_time + timedelta(minutes=10)
         sch.add_job(
             lambda ev=it: asyncio.create_task(bot.send_message(s.telegram_chat_id, build_followup(ev))),
             trigger=DateTrigger(run_date=fol_t)
         )
+        log.info(f"[06:55] Scheduled follow-up for {it.event} at {fol_t.strftime('%H:%M')}")
 
 async def job_signals(bot: Bot):
+    log.info("[Signal] Generating trading signals…")
     s = get_settings()
     sigs = await generate_signals_max5()
     for sig in sigs:
@@ -104,31 +113,29 @@ async def job_signals(bot: Bot):
             f"🕒 Thời gian: {sig.vn_time}"
         )
         await bot.send_message(s.telegram_chat_id, text)
+    log.info(f"[Signal] Sent {len(sigs)} signals")
 
 async def job_summary(bot: Bot):
+    log.info("[22:00] Sending daily summary…")
     s = get_settings()
     await bot.send_message(
         s.telegram_chat_id,
         f"🌙 Tổng kết hôm nay ({fmt_vn()}):\nHiệu suất: cập nhật sau…\nCảm ơn bạn đã đồng hành cùng Cofure. Ngủ ngon nha! 😴"
     )
+    log.info("[22:00] Summary sent")
 
 def schedule_all(app):
-    """Đăng ký toàn bộ lịch chạy định kỳ."""
     global _SCHED
     s = get_settings()
     bot = app.bot
     sch = AsyncIOScheduler(timezone=s.tz)
 
-    # 06:55 — đọc lịch hôm nay và lên job cảnh báo theo từng sự kiện High
     sch.add_job(lambda: asyncio.create_task(_schedule_macro_alerts(bot)), CronTrigger(hour=6, minute=55))
-    # 07:00 — gửi lịch vĩ mô của ngày
     sch.add_job(job_macro, CronTrigger(hour=7, minute=0), kwargs={"bot": bot})
-    # 06:00 — chào buổi sáng
     sch.add_job(job_morning, CronTrigger(hour=6, minute=0), kwargs={"bot": bot})
-    # 06:00–22:00 — mỗi 30'
     sch.add_job(job_signals, CronTrigger(hour="6-21", minute="0,30"), kwargs={"bot": bot})
-    # 22:00 — tổng kết
     sch.add_job(job_summary, CronTrigger(hour=22, minute=0), kwargs={"bot": bot})
 
     sch.start()
     _SCHED = sch
+    log.info("Scheduler started")
