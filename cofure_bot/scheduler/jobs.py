@@ -3,11 +3,12 @@ import datetime as dt
 from datetime import datetime
 from telegram.ext import Application, ContextTypes, JobQueue
 import pytz
-from ..config import TELEGRAM_ALLOWED_USER_ID, TZ_NAME
-from ..signals.engine import generate_batch
-from ..data.binance_client import active_symbols, top_gainers, quick_signal_metrics
-from ..data.macro_calendar import fetch_macro_today
-from ..storage.state import bump_signals, bump_alerts, snapshot
+
+from cofure_bot.config import TELEGRAM_ALLOWED_USER_ID, TZ_NAME
+from cofure_bot.signals.engine import generate_batch
+from cofure_bot.data.binance_client import active_symbols, top_gainers, quick_signal_metrics
+from cofure_bot.data.macro_calendar import fetch_macro_today
+from cofure_bot.storage.state import bump_signals, bump_alerts, snapshot
 
 VN_TZ = pytz.timezone(TZ_NAME)
 
@@ -91,7 +92,6 @@ async def job_halfhour_signals(context: ContextTypes.DEFAULT_TYPE):
         syms = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]
     candidates = syms[:MAX_CANDIDATES]
     signals = await generate_batch(candidates, count=5)
-    # 3 Scalping + 2 Swing
     for i, s in enumerate(signals):
         s["signal_type"] = "Scalping" if i < 3 else "Swing"
         s["order_type"] = "Market"
@@ -136,7 +136,6 @@ async def job_night_summary(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=text)
 
 def setup_jobs(app: Application):
-    # Đảm bảo JobQueue tồn tại trong chế độ webhook
     jq = app.job_queue
     if jq is None:
         jq = JobQueue()
@@ -144,9 +143,8 @@ def setup_jobs(app: Application):
         jq.start()
         app.job_queue = jq
 
-    # Lịch cố định theo giờ VN
     jq.run_daily(job_morning,       time=dt.time(hour=6,  minute=0, tzinfo=VN_TZ), name="morning_0600")
     jq.run_daily(job_macro,         time=dt.time(hour=7,  minute=0, tzinfo=VN_TZ), name="macro_0700")
-    jq.run_repeating(job_halfhour_signals, interval=1800, first=5,  name="signals_30m")   # mỗi 30'
-    jq.run_repeating(job_urgent_alerts,    interval=300,  first=15, name="alerts_5m")     # mỗi 5'
+    jq.run_repeating(job_halfhour_signals, interval=1800, first=5,  name="signals_30m")
+    jq.run_repeating(job_urgent_alerts,    interval=300,  first=15, name="alerts_5m")
     jq.run_daily(job_night_summary, time=dt.time(hour=22, minute=0, tzinfo=VN_TZ), name="summary_2200")
