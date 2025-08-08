@@ -73,3 +73,5 @@ async def main():
         await application.stop()
         await application.shutdown()
         await runner.cleanup()
+from .handlers.signals import send_signals
+application.add_handler(CommandHandler("signals", send_signals))
