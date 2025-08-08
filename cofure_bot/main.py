@@ -6,6 +6,7 @@ from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters
 from .config import APP_NAME, PORT, TELEGRAM_BOT_TOKEN, PUBLIC_BASE_URL
 from .handlers.commands import start, on_text
+from .scheduler.jobs import setup_jobs  # <-- thêm import này
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -64,6 +65,10 @@ async def _start_telegram_webhook() -> Application:
 async def main():
     # Khởi động Telegram (webhook)
     application = await _start_telegram_webhook()
+
+    # Đăng ký lịch gửi tín hiệu 30'
+    setup_jobs(application)
+
     # Khởi động web server aiohttp (health + webhook endpoint)
     runner = await _start_aiohttp(application)
 
