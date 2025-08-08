@@ -5,7 +5,7 @@ from telegram.ext import Application, ContextTypes, JobQueue
 import pytz
 
 from cofure_bot.config import TELEGRAM_ALLOWED_USER_ID, TZ_NAME
-from cofure_bot.signals.engine import generate_batch
+from cofure_bot.signals.engine import generate_batch, generate_signal
 from cofure_bot.data.binance_client import active_symbols, top_gainers, quick_signal_metrics
 from cofure_bot.data.macro_calendar import fetch_macro_today
 from cofure_bot.storage.state import bump_signals, bump_alerts, snapshot
@@ -16,7 +16,7 @@ VN_TZ = pytz.timezone(TZ_NAME)
 MIN_QUOTE_VOL = 5_000_000.0   # lọc cặp volume >= 5 triệu USDT/24h
 MAX_CANDIDATES = 60           # giới hạn số symbol đem đi tính
 ALERT_MAX_PER_RUN = 3         # tối đa 3 cảnh báo mỗi lần quét
-ALERT_FUNDING = 0.02          # |funding| >= 2%o
+ALERT_FUNDING = 0.02          # |funding| >= 2‰
 ALERT_VOLRATIO = 1.8          # bùng nổ volume >= x1.8 so với MA20
 WORK_START = 6
 WORK_END = 22
@@ -26,9 +26,24 @@ def _in_work_hours() -> bool:
     return WORK_START <= now.hour < WORK_END
 
 def _fmt_signal(sig: dict) -> str:
-    # nhãn sức mạnh
+    """Format tin nhắn lệnh cho Telegram (linh hoạt thêm lý do Funding/Vol5m nếu có)."""
     label = "Mạnh" if sig["strength"] >= 70 else ("Tiêu chuẩn" if sig["strength"] >= 50 else "Tham khảo")
     side_square = "🟩" if sig["side"] == "LONG" else "🟥"
+
+    reasons = []
+    # các lý do động
+    if "funding" in sig and sig["funding"] is not None:
+        reasons.append(f"Funding={sig['funding']:.4f}")
+    if "vol_ratio" in sig and sig["vol_ratio"] is not None:
+        reasons.append(f"Vol5m=x{sig['vol_ratio']:.2f}")
+    if sig.get("rsi") is not None:
+        reasons.append(f"RSI={sig['rsi']}")
+    if sig.get("ema9") is not None:
+        reasons.append(f"EMA9={sig['ema9']}")
+    if sig.get("ema21") is not None:
+        reasons.append(f"EMA21={sig['ema21']}")
+    reason_str = ", ".join(reasons)
+
     return (
         f"📈 {sig['token']} — {side_square} {sig['side']}\n\n"
         f"🟢 Loại lệnh: {sig.get('signal_type','Scalping')}\n"
@@ -37,7 +52,7 @@ def _fmt_signal(sig: dict) -> str:
         f"🎯 TP: {sig['tp']}\n"
         f"🛡️ SL: {sig['sl']}\n"
         f"📊 Độ mạnh: {sig['strength']}% ({label})\n"
-        f"📌 Lý do: RSI={sig['rsi']}, EMA9={sig['ema9']}, EMA21={sig['ema21']}\n"
+        f"📌 Lý do: {reason_str}\n"
         f"🕒 Thời gian: {sig['time']}"
     )
 
@@ -70,7 +85,6 @@ async def job_macro(context: ContextTypes.DEFAULT_TYPE):
         if e.get("forecast"): extra.append(f"Dự báo {e['forecast']}")
         if e.get("previous"): extra.append(f"Trước {e['previous']}")
         extra_str = (" — " + ", ".join(extra)) if extra else ""
-        # đếm ngược
         left = e["time_vn"] - now
         if left.total_seconds() > 0:
             h = int(left.total_seconds() // 3600)
@@ -98,7 +112,7 @@ async def job_halfhour_signals(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=_fmt_signal(s))
         bump_signals(1)
 
-# === 06:00→22:00 — Mỗi 5' cảnh báo khẩn khi funding/volume bất thường ===
+# === 06:00→22:00 — Mỗi 5' cảnh báo khẩn (phát lệnh đẹp) ===
 async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
     if not _in_work_hours():
         return
@@ -108,18 +122,28 @@ async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
         for sym in syms[:MAX_CANDIDATES]:
             try:
                 m = await quick_signal_metrics(session, sym, interval="5m")
-                if abs(m["funding"]) >= ALERT_FUNDING or m["vol_ratio"] >= ALERT_VOLRATIO:
-                    arrow = "▲" if m["vol_ratio"] >= ALERT_VOLRATIO else ""
-                    side_hint = "Long nghiêng" if m["funding"] > 0 else ("Short nghiêng" if m["funding"] < 0 else "Trung tính")
-                    text = (f"⏰ Cảnh báo khẩn — {sym}\n"
-                            f"• Funding: {m['funding']:.4f} ({side_hint})\n"
-                            f"• Volume 5m: x{m['vol_ratio']:.2f} {arrow}\n"
-                            f"• Gợi ý: cân nhắc {'MUA' if m['funding']>0 else 'BÁN' if m['funding']<0 else 'quan sát'} nếu ổn định thêm.")
-                    await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=text)
-                    bump_alerts(1)
-                    alerts += 1
-                    if alerts >= ALERT_MAX_PER_RUN:
-                        break
+
+                # Điều kiện khẩn
+                if (abs(m["funding"]) < ALERT_FUNDING) and (m["vol_ratio"] < ALERT_VOLRATIO):
+                    continue
+
+                # Tạo tín hiệu theo format chuẩn
+                s = await generate_signal(sym)   # gồm: side/entry/tp/sl/strength/rsi/ema9/ema21/time
+                s["signal_type"] = "Swing (Khẩn)"
+                s["order_type"]  = "Market"
+                s["funding"]     = m["funding"]
+                s["vol_ratio"]   = m["vol_ratio"]
+
+                side_hint = "Long nghiêng" if m["funding"] > 0 else ("Short nghiêng" if m["funding"] < 0 else "Trung tính")
+                guidance = f"\n💡 Gợi ý: ưu tiên {'MUA' if s['side']=='LONG' else 'BÁN'} nếu ổn định thêm ({side_hint})."
+
+                text = "⏰ TÍN HIỆU KHẨN\n\n" + _fmt_signal(s) + guidance
+                await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=text)
+                bump_alerts(1)
+
+                alerts += 1
+                if alerts >= ALERT_MAX_PER_RUN:
+                    break
             except Exception:
                 continue
 
@@ -136,6 +160,7 @@ async def job_night_summary(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=text)
 
 def setup_jobs(app: Application):
+    # Đảm bảo JobQueue tồn tại (webhook mode)
     jq = app.job_queue
     if jq is None:
         jq = JobQueue()
@@ -143,8 +168,9 @@ def setup_jobs(app: Application):
         jq.start()
         app.job_queue = jq
 
+    # Lịch cố định theo giờ VN
     jq.run_daily(job_morning,       time=dt.time(hour=6,  minute=0, tzinfo=VN_TZ), name="morning_0600")
     jq.run_daily(job_macro,         time=dt.time(hour=7,  minute=0, tzinfo=VN_TZ), name="macro_0700")
-    jq.run_repeating(job_halfhour_signals, interval=1800, first=5,  name="signals_30m")
-    jq.run_repeating(job_urgent_alerts,    interval=300,  first=15, name="alerts_5m")
+    jq.run_repeating(job_halfhour_signals, interval=1800, first=5,  name="signals_30m")   # mỗi 30'
+    jq.run_repeating(job_urgent_alerts,    interval=300,  first=15, name="alerts_5m")     # mỗi 5'
     jq.run_daily(job_night_summary, time=dt.time(hour=22, minute=0, tzinfo=VN_TZ), name="summary_2200")
