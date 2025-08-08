@@ -9,7 +9,7 @@ class ReleaseData:
     previous: str | None = None
 
 def build_prealert(it: MacroItem) -> str:
-    return f"⏳ {it.event} lúc {it.time} (Ảnh hưởng: {it.impact})\nLời khuyên: giảm rủi ro/đứng ngoài trước 5–15’."
+    return f"⏳ {it.event} lúc {it.time} (Ảnh hưởng: High)\nLời khuyên: giảm rủi ro/đứng ngoài trước 5–15’."
 
 def build_onrelease(it: MacroItem, data: ReleaseData | None = None) -> str:
     head = f"🕯️ {it.event} ({it.time})"
