@@ -1,6 +1,7 @@
 import aiohttp
-from telegram.ext import Application, ContextTypes, JobQueue
+import datetime as dt
 from datetime import datetime
+from telegram.ext import Application, ContextTypes, JobQueue
 import pytz
 from ..config import TELEGRAM_ALLOWED_USER_ID, TZ_NAME
 from ..signals.engine import generate_batch
@@ -125,7 +126,6 @@ async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
 # === 22:00 — Tổng kết phiên ===
 async def job_night_summary(context: ContextTypes.DEFAULT_TYPE):
     snap = snapshot()
-    now = datetime.now(VN_TZ)
     text = (
         "🌒 Tổng kết phiên\n"
         f"• Tín hiệu đã gửi: {snap['signals_sent']}\n"
@@ -145,13 +145,8 @@ def setup_jobs(app: Application):
         app.job_queue = jq
 
     # Lịch cố định theo giờ VN
-    # 06:00 sáng
-    jq.run_daily(job_morning, time=datetime.time(hour=6, minute=0, tzinfo=VN_TZ), name="morning_0600")
-    # 07:00 lịch vĩ mô
-    jq.run_daily(job_macro, time=datetime.time(hour=7, minute=0, tzinfo=VN_TZ), name="macro_0700")
-    # Mỗi 30 phút tín hiệu (tự kiểm tra khung giờ)
-    jq.run_repeating(job_halfhour_signals, interval=1800, first=5, name="signals_30m")
-    # Mỗi 5 phút cảnh báo khẩn (tự kiểm tra khung giờ)
-    jq.run_repeating(job_urgent_alerts, interval=300, first=15, name="alerts_5m")
-    # 22:00 tổng kết phiên
-    jq.run_daily(job_night_summary, time=datetime.time(hour=22, minute=0, tzinfo=VN_TZ), name="summary_2200")
+    jq.run_daily(job_morning,       time=dt.time(hour=6,  minute=0, tzinfo=VN_TZ), name="morning_0600")
+    jq.run_daily(job_macro,         time=dt.time(hour=7,  minute=0, tzinfo=VN_TZ), name="macro_0700")
+    jq.run_repeating(job_halfhour_signals, interval=1800, first=5,  name="signals_30m")   # mỗi 30'
+    jq.run_repeating(job_urgent_alerts,    interval=300,  first=15, name="alerts_5m")     # mỗi 5'
+    jq.run_daily(job_night_summary, time=dt.time(hour=22, minute=0, tzinfo=VN_TZ), name="summary_2200")
