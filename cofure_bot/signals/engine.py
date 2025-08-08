@@ -15,7 +15,7 @@ def _decide_side(m):
         return "LONG"
     if m["ema50"] < m["ema200"] and m["rsi"] <= 55:
         return "SHORT"
-    # trung tính → theo funding
+    # Trung tính → theo funding
     return "LONG" if m["funding"] >= 0 else "SHORT"
 
 def _strength(m, side):
@@ -66,7 +66,7 @@ async def generate_signal(symbol: str) -> dict:
         "ema9": round(ema9, 3),
         "ema21": round(ema21, 3),
         "time": now_vn_str(),
-        # gợi ý mặc định; scheduler sẽ gán 3 Scalping + 2 Swing & Market/Limit nếu cần
+        # mac định; scheduler sẽ set 3 Scalping + 2 Swing & Market/Limit
         "signal_type": "Scalping",
         "order_type": "Market",
     }
