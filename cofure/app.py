@@ -34,8 +34,10 @@ async def startup():
     schedule_all(_application)
     log.info("Scheduler initialized")
 
-    # Run Telegram polling in background
-    _polling_task = asyncio.create_task(_application.run_polling())
+    # Run Telegram polling in background (fix close loop error)
+    _polling_task = asyncio.create_task(
+        _application.run_polling(close_loop=False)
+    )
     log.info("Bot polling started")
 
 @app.on_event("shutdown")
