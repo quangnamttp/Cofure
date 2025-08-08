@@ -8,16 +8,10 @@ from cofure.utils.http import client
 class MacroItem:
     time: str   # HH:MM (giờ VN)
     event: str
-    impact: str # Low | Medium | High
+    impact: str # High
     note: str | None = None
 
 FF_URL = "https://www.forexfactory.com/calendar?day=today"
-
-IMPACT_MAP = {
-    "Low": "Low", "low": "Low",
-    "Medium": "Medium", "medium": "Medium",
-    "High": "High", "high": "High",
-}
 
 def to_vn_time(hhmm: str) -> str:
     """Chuyển từ HH:MM GMT -> Asia/Ho_Chi_Minh (+7)."""
@@ -33,7 +27,7 @@ def _clean_text(x: str) -> str:
     return " ".join((x or "").split())
 
 async def load_today_items() -> List[MacroItem]:
-    """Lấy lịch hôm nay từ ForexFactory, lọc Medium/High."""
+    """Lấy lịch hôm nay từ ForexFactory, CHỈ lọc High."""
     try:
         async with client() as c:
             r = await c.get(FF_URL)
@@ -54,8 +48,8 @@ async def load_today_items() -> List[MacroItem]:
             raw_event = _clean_text(ev_el.get_text())
             raw_imp = _clean_text(imp_el.get_text()) or _clean_text(imp_el.get("title") or "")
 
-            impact = IMPACT_MAP.get(raw_imp, raw_imp or "Low")
-            if impact not in ("Medium", "High"):
+            # Chỉ giữ High
+            if "High" not in raw_imp:
                 continue
 
             if raw_time and raw_time != "--":
@@ -63,7 +57,7 @@ async def load_today_items() -> List[MacroItem]:
             else:
                 continue
 
-            items.append(MacroItem(time=hhmm_vn, event=raw_event, impact=impact))
+            items.append(MacroItem(time=hhmm_vn, event=raw_event, impact="High"))
 
         def _to_minutes(t: str) -> int:
             try:
