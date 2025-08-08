@@ -1,5 +1,5 @@
 import aiohttp
-from telegram.ext import Application, ContextTypes
+from telegram.ext import Application, ContextTypes, JobQueue  # <-- thêm JobQueue
 from datetime import datetime
 import pytz
 from ..config import TELEGRAM_ALLOWED_USER_ID, TZ_NAME
@@ -42,5 +42,13 @@ async def job_halfhour_signals(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=text)
 
 def setup_jobs(app: Application):
+    # Đảm bảo JobQueue tồn tại trong chế độ webhook
+    jq = app.job_queue
+    if jq is None:
+        jq = JobQueue()
+        jq.set_application(app)
+        jq.start()
+        app.job_queue = jq
+
     # chạy mỗi 30 phút; job tự check khung giờ VN
-    app.job_queue.run_repeating(job_halfhour_signals, interval=1800, first=5, name="signals_30m")
+    jq.run_repeating(job_halfhour_signals, interval=1800, first=5, name="signals_30m")
