@@ -1,97 +1,149 @@
-import asyncio
-import logging
-import sys
-from aiohttp import web
-from telegram import Update, BotCommand
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters
-from .config import APP_NAME, PORT, TELEGRAM_BOT_TOKEN, PUBLIC_BASE_URL
-from .handlers.commands import start, on_text
-from .handlers.menu import (
-    lich_hom_nay_cmd, lich_ngay_mai_cmd, lich_ca_tuan_cmd, test_full_cmd
+import aiohttp
+from telegram import Update
+from telegram.ext import ContextTypes
+import pytz
+from datetime import datetime, timedelta
+
+from ..config import TELEGRAM_ALLOWED_USER_ID, TZ_NAME
+from ..data.macro_calendar import fetch_macro_for_date
+from ..data.binance_client import active_symbols, quick_signal_metrics
+from ..signals.engine import generate_batch
+from ..scheduler.jobs import (
+    _fmt_signal, MIN_QUOTE_VOL, MAX_CANDIDATES,
+    ALERT_FUNDING, ALERT_VOLRATIO,
+    job_morning, job_macro
 )
-from .scheduler.jobs import setup_jobs  # job 30' + jobs theo giờ
 
-logging.basicConfig(
-    stream=sys.stdout,
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-logger = logging.getLogger(APP_NAME)
+VN_TZ = pytz.timezone(TZ_NAME)
 
-# -------- AIOHTTP (endpoints) --------
-async def index(request):
-    return web.json_response({"status": "ok", "app": APP_NAME})
+def _authorized(update: Update) -> bool:
+    u = update.effective_user
+    return bool(u and u.id == TELEGRAM_ALLOWED_USER_ID)
 
-async def health(request):
-    return web.json_response({"status": "ok", "app": APP_NAME})
+# ===== Helpers: format lịch vĩ mô =====
+def _fmt_events_header(day: datetime) -> str:
+    dow = day.isoweekday()  # 1..7
+    return f"📅 Thứ {dow}, ngày {day.strftime('%d/%m/%Y')}"
 
-async def info(request):
-    return web.Response(text=f"{APP_NAME} is running", content_type="text/plain")
+def _fmt_events(day: datetime, events: list) -> str:
+    if not events:
+        return _fmt_events_header(day) + "\n\nHôm nay/Ngày này không có tin tức vĩ mô quan trọng.\nChúc bạn một ngày trade thật thành công nha!"
+    now = datetime.now(VN_TZ)
+    lines = [_fmt_events_header(day), "", "🧭 Lịch tin vĩ mô quan trọng:"]
+    for e in events:
+        tstr = e["time_vn"].strftime("%H:%M")
+        extra = []
+        if e.get("forecast"): extra.append(f"Dự báo {e['forecast']}")
+        if e.get("previous"): extra.append(f"Trước {e['previous']}")
+        extra_str = (" — " + ", ".join(extra)) if extra else ""
+        # đếm ngược
+        left = e["time_vn"] - now
+        if left.total_seconds() > 0:
+            h = int(left.total_seconds() // 3600)
+            m = int((left.total_seconds() % 3600)//60)
+            countdown = f" — ⏳ còn {h} giờ {m} phút" if h else f" — ⏳ còn {m} phút"
+        else:
+            countdown = ""
+        lines.append(f"• {tstr} — {e['title_vi']} — Ảnh hưởng: {e['impact']}{extra_str}{countdown}")
+    lines.append("\n💡 Gợi ý: Đứng ngoài 5–10’ quanh giờ ra tin; quan sát funding/volume.")
+    return "\n".join(lines)
 
-async def webhook_handler(request):
-    data = await request.json()
-    application: Application = request.app["application"]
-    update = Update.de_json(data, application.bot)
-    await application.update_queue.put(update)
-    return web.Response(status=200)
+# ===== Commands trong menu =====
+async def lich_hom_nay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update): return
+    day = datetime.now(VN_TZ)
+    events = await fetch_macro_for_date(day.date())
+    await update.message.reply_text(_fmt_events(day, events))
 
-async def _start_aiohttp(application: Application):
-    app = web.Application()
-    app["application"] = application
-    app.router.add_get("/", index)
-    app.router.add_get("/health", health)
-    app.router.add_get("/info", info)
-    app.router.add_post("/webhook", webhook_handler)
+async def lich_ngay_mai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update): return
+    day = datetime.now(VN_TZ) + timedelta(days=1)
+    events = await fetch_macro_for_date(day.date())
+    await update.message.reply_text(_fmt_events(day, events))
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    return runner
+async def lich_ca_tuan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update): return
+    today = datetime.now(VN_TZ)
+    monday = today - timedelta(days=today.weekday())  # Thứ 2 tuần hiện tại
+    texts = []
+    for i in range(7):
+        d = monday + timedelta(days=i)
+        ev = await fetch_macro_for_date(d.date())
+        texts.append(_fmt_events(d, ev))
+    # Ngăn tin quá dài: gửi theo từng ngày, hoặc gộp nhẹ
+    chunk = "\n\n" + ("—" * 8) + "\n\n"
+    joined = chunk.join(texts)
+    # Telegram giới hạn 4096 ký tự mỗi tin -> chia nhỏ nếu cần
+    while joined:
+        part = joined[:3500]
+        cut = part.rfind("\n")
+        if cut == -1: cut = len(part)
+        await update.message.reply_text(part[:cut])
+        joined = joined[cut:].lstrip("\n")
 
-# -------- Telegram (WEBHOOK) --------
-async def _start_telegram_webhook() -> Application:
-    application: Application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+async def test_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Chạy ngay: chào sáng → lịch vĩ mô → 5 tín hiệu (riêng lẻ) → tối đa 2 cảnh báo khẩn → mô phỏng tổng kết.
+    Không phụ thuộc khung giờ.
+    """
+    if not _authorized(update): return
+    await update.message.reply_text("🚀 Bắt đầu test FULL: chào sáng → lịch vĩ mô → 5 tín hiệu → cảnh báo khẩn → tổng kết.")
 
-    # Handlers cơ bản
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    # Handlers menu (lịch + test full)
-    application.add_handler(CommandHandler("lich_hom_nay", lich_hom_nay_cmd))
-    application.add_handler(CommandHandler("lich_ngay_mai", lich_ngay_mai_cmd))
-    application.add_handler(CommandHandler("lich_ca_tuan", lich_ca_tuan_cmd))
-    application.add_handler(CommandHandler("test_full", test_full_cmd))
-
-    await application.initialize()
-    await application.start()
-
-    # Đăng ký menu lệnh hiển thị trong Telegram
-    await application.bot.set_my_commands([
-        BotCommand("lich_hom_nay", "📅 Tin vĩ mô hôm nay"),
-        BotCommand("lich_ngay_mai", "📅 Tin vĩ mô ngày mai"),
-        BotCommand("lich_ca_tuan", "📅 Lịch từ Thứ 2 đến Chủ nhật"),
-        BotCommand("test_full", "🧪 Test đầy đủ 06:00→22:00"),
-    ])
-
-    webhook_url = f"{PUBLIC_BASE_URL.rstrip('/')}/webhook"  # tránh //webhook
-    await application.bot.set_webhook(webhook_url)
-    logger.info("Webhook set to %s", webhook_url)
-    return application
-
-async def main():
-    # Khởi động Telegram (webhook)
-    application = await _start_telegram_webhook()
-
-    # Đăng ký các job theo giờ + tín hiệu 30'
-    setup_jobs(application)
-
-    # Khởi động web server aiohttp (health + webhook)
-    runner = await _start_aiohttp(application)
-
+    # 1) Chào buổi sáng + top gainers (tận dụng job sẵn)
     try:
-        await asyncio.Event().wait()
-    finally:
-        await application.stop()
-        await application.shutdown()
-        await runner.cleanup()
+        await job_morning(context)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Lỗi phần chào sáng: {e}")
+
+    # 2) Lịch vĩ mô hôm nay (tận dụng job sẵn)
+    try:
+        await job_macro(context)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Lỗi phần lịch vĩ mô: {e}")
+
+    # 3) 5 tín hiệu RIÊNG LẺ — bỏ qua khung giờ
+    try:
+        async with aiohttp.ClientSession() as session:
+            syms = await active_symbols(session, min_quote_volume=MIN_QUOTE_VOL)
+        if not syms:
+            syms = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]
+        sigs = await generate_batch(syms[:MAX_CANDIDATES], count=5)
+        for i, s in enumerate(sigs):
+            s["signal_type"] = "Scalping" if i < 3 else "Swing"
+            s["order_type"] = "Market"
+            await update.message.reply_text(_fmt_signal(s))
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Lỗi phần tín hiệu: {e}")
+
+    # 4) Cảnh báo khẩn — quét nhanh, tối đa 2 cảnh báo
+    try:
+        sent = 0
+        async with aiohttp.ClientSession() as session:
+            syms = await active_symbols(session, min_quote_volume=MIN_QUOTE_VOL)
+            for sym in syms[:MAX_CANDIDATES]:
+                m = await quick_signal_metrics(session, sym, interval="5m")
+                if abs(m["funding"]) >= ALERT_FUNDING or m["vol_ratio"] >= ALERT_VOLRATIO:
+                    arrow = "▲" if m["vol_ratio"] >= ALERT_VOLRATIO else ""
+                    side_hint = "Long nghiêng" if m["funding"] > 0 else ("Short nghiêng" if m["funding"] < 0 else "Trung tính")
+                    text = (f"⏰ Cảnh báo khẩn — {sym}\n"
+                            f"• Funding: {m['funding']:.4f} ({side_hint})\n"
+                            f"• Volume 5m: x{m['vol_ratio']:.2f} {arrow}\n"
+                            f"• Gợi ý: cân nhắc {'MUA' if m['funding']>0 else 'BÁN' if m['funding']<0 else 'quan sát'} nếu ổn định thêm.")
+                    await update.message.reply_text(text)
+                    sent += 1
+                    if sent >= 2:
+                        break
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Lỗi phần cảnh báo khẩn: {e}")
+
+    # 5) Mô phỏng tổng kết
+    try:
+        await update.message.reply_text(
+            "🌒 Tổng kết phiên (mô phỏng)\n"
+            "• Tín hiệu đã gửi: ~5 (trong test)\n"
+            "• Cảnh báo khẩn: ~0–2 (trong test)\n"
+            "• Dự báo tối: Giữ kỷ luật, giảm đòn bẩy khi biến động mạnh.\n\n"
+            "🌙 Cảm ơn bạn đã đồng hành cùng Cofure hôm nay. 😴 Ngủ ngon nha!"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Lỗi phần tổng kết: {e}")
