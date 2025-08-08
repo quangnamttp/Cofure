@@ -38,7 +38,7 @@ async def _start_telegram():
 
     await application.initialize()
     await application.start()
-    await application.updater.start_polling(allowed_updates=Application.ALL_UPDATE_TYPES)
+    await application.updater.start_polling()
     return application
 
 async def main():
