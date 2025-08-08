@@ -16,10 +16,10 @@ VN_TZ = pytz.timezone(TZ_NAME)
 MIN_QUOTE_VOL = 5_000_000.0   # lọc cặp volume >= 5 triệu USDT/24h
 MAX_CANDIDATES = 60           # giới hạn số symbol đem đi tính
 ALERT_MAX_PER_RUN = 3         # tối đa 3 cảnh báo mỗi lần quét
-ALERT_FUNDING = 0.02          # |funding| >= 2‰
-ALERT_VOLRATIO = 1.8          # bùng nổ volume >= x1.8 so với MA20
+ALERT_FUNDING   = 0.02        # |funding| >= 2‰
+ALERT_VOLRATIO  = 1.8         # bùng nổ volume >= x1.8 so với MA20
 WORK_START = 6
-WORK_END = 22
+WORK_END   = 22
 
 def _in_work_hours() -> bool:
     now = datetime.now(VN_TZ)
@@ -31,7 +31,6 @@ def _fmt_signal(sig: dict) -> str:
     side_square = "🟩" if sig["side"] == "LONG" else "🟥"
 
     reasons = []
-    # các lý do động
     if "funding" in sig and sig["funding"] is not None:
         reasons.append(f"Funding={sig['funding']:.4f}")
     if "vol_ratio" in sig and sig["vol_ratio"] is not None:
@@ -56,11 +55,33 @@ def _fmt_signal(sig: dict) -> str:
         f"🕒 Thời gian: {sig['time']}"
     )
 
-# === 06:00 — Chào buổi sáng + top gainers ===
+# === 06:00 — Chào buổi sáng + top gainers + USD/VND ===
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
+    # 1) Lấy tỷ giá USD/VND (fallback nếu lỗi)
+    usd_vnd = None
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                "https://api.exchangerate.host/latest",
+                params={"base": "USD", "symbols": "VND"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    usd_vnd = float(data.get("rates", {}).get("VND") or 0) or None
+    except Exception:
+        usd_vnd = None
+
+    # 2) Top 5 tăng trưởng
     async with aiohttp.ClientSession() as session:
         gainers = await top_gainers(session, 5)
-    lines = ["Chào buổi sáng nhé Cofure ☀️  (USD≈VND - tham chiếu)", "", "🔥 5 đồng tăng trưởng nổi bật (24h):"]
+
+    # 3) Soạn tin
+    if usd_vnd:
+        lines = [f"Chào buổi sáng nhé Cofure ☀️  (1 USD ≈ {usd_vnd:,.0f} VND)", ""]
+    else:
+        lines = ["Chào buổi sáng nhé Cofure ☀️  (USD≈VND - tham chiếu)", ""]
+    lines.append("🔥 5 đồng tăng trưởng nổi bật (24h):")
     for g in gainers:
         sym = g.get("symbol")
         chg = float(g.get("priceChangePercent", 0) or 0)
@@ -68,7 +89,14 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• <b>{sym}</b> ▲ {chg:.2f}% | Volume: {vol:,.0f} USDT")
     lines.append("")
     lines.append("📊 Funding, volume, xu hướng sẽ có trong tín hiệu định kỳ suốt ngày.")
-    await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text="\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+    # 4) Gửi
+    await context.bot.send_message(
+        chat_id=TELEGRAM_ALLOWED_USER_ID,
+        text="\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 # === 07:00 — Lịch vĩ mô hôm nay ===
 async def job_macro(context: ContextTypes.DEFAULT_TYPE):
@@ -123,12 +151,10 @@ async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
             try:
                 m = await quick_signal_metrics(session, sym, interval="5m")
 
-                # Điều kiện khẩn
                 if (abs(m["funding"]) < ALERT_FUNDING) and (m["vol_ratio"] < ALERT_VOLRATIO):
                     continue
 
-                # Tạo tín hiệu theo format chuẩn
-                s = await generate_signal(sym)   # gồm: side/entry/tp/sl/strength/rsi/ema9/ema21/time
+                s = await generate_signal(sym)   # side/entry/tp/sl/strength/rsi/ema9/ema21/time
                 s["signal_type"] = "Swing (Khẩn)"
                 s["order_type"]  = "Market"
                 s["funding"]     = m["funding"]
