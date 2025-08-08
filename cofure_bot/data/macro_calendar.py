@@ -1,3 +1,5 @@
+# cofure_bot/data/macro_calendar.py
+
 import aiohttp
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
@@ -8,13 +10,19 @@ VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 # JSON feed chính thức của ForexFactory cho tuần hiện tại
 FF_THISWEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
-# Từ khóa sự kiện quan trọng cần lọc
-IMPORTANT = {
-    "CPI", "Core CPI", "PCE", "Core PCE", "FOMC", "Fed", "Interest Rate",
-    "Unemployment", "Non-Farm", "NFP", "PPI", "GDP", "Retail Sales", "PMI", "ISM"
+# Từ khóa sự kiện quan trọng tác động mạnh tới crypto (so khớp chữ IN HOA)
+CRYPTO_KEYS = {
+    "CPI", "CORE CPI",
+    "PCE", "CORE PCE",
+    "FOMC", "FED",
+    "INTEREST RATE", "RATE DECISION", "PRESS CONFERENCE",
+    "UNEMPLOYMENT", "UNEMPLOYMENT RATE",
+    "NON-FARM", "NFP",
+    "PPI", "GDP", "RETAIL SALES",
+    "ISM", "PMI"
 }
 
-IMPACT_MAP = {1:"Low", 2:"Medium", 3:"High", 4:"Holiday"}
+IMPACT_MAP = {1: "Low", 2: "Medium", 3: "High", 4: "Holiday"}
 
 def _parse_dt_any(v: Any) -> Optional[datetime]:
     """
@@ -30,8 +38,7 @@ def _parse_dt_any(v: Any) -> Optional[datetime]:
         ts = float(v)
         if ts > 1e12:  # ms
             ts = ts / 1000.0
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        return dt
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
     # chuỗi ISO
     if isinstance(v, str):
         s = v.strip()
@@ -71,14 +78,19 @@ def _vi(title: str) -> str:
         "Core PCE": "PCE lõi",
         "PCE": "Chi tiêu tiêu dùng cá nhân (PCE)",
         "Interest Rate": "Quyết định lãi suất",
+        "Rate Decision": "Quyết định lãi suất",
+        "Press Conference": "Họp báo",
+        "Unemployment Rate": "Tỷ lệ thất nghiệp",
         "Unemployment": "Tỷ lệ thất nghiệp",
         "Non-Farm": "Bảng lương phi nông nghiệp (NFP)",
+        "NFP": "Bảng lương phi nông nghiệp (NFP)",
         "Retail Sales": "Doanh số bán lẻ",
         "GDP": "Tổng sản phẩm quốc nội (GDP)",
         "PPI": "Chỉ số giá sản xuất (PPI)",
         "FOMC": "FOMC",
         "PMI": "PMI",
         "ISM": "Chỉ số ISM",
+        "Fed": "Fed",
     }
     out = title or ""
     for k, v in rep.items():
@@ -96,11 +108,15 @@ async def _fetch_ff_week() -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-def _filter_events(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Chỉ giữ sự kiện quan trọng & chuẩn hóa field."""
+def _filter_events_crypto_high(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Giữ sự kiện:
+      - Thuộc nhóm từ khóa CRYPTO_KEYS (bắt buộc)
+      - Impact cao: High / Very High (bắt buộc)
+    Chuẩn hóa field và quy đổi giờ VN.
+    """
     out: List[Dict[str, Any]] = []
     for e in raw or []:
-        # FF có nhiều schema; cố gắng gom các field phổ biến
         title = str(e.get("title") or e.get("event") or "")
         if not title:
             continue
@@ -110,16 +126,21 @@ def _filter_events(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             _parse_dt_any(e.get("timestamp")) or
             _parse_dt_any(e.get("dateTime")) or
             _parse_dt_any(e.get("date")) or
-            _parse_dt_any(e.get("updated"))  # fallback
+            _parse_dt_any(e.get("updated"))
         )
         if not dt_utc:
             continue
         t_vn = _to_vn(dt_utc)
 
+        # impact
         impact = _norm_impact(e.get("impact"))
-        # lọc: từ khóa quan trọng hoặc impact cao
-        important = any(k in title for k in IMPORTANT) or impact.lower() in {"high", "very high"}
-        if not important:
+        impact_ok = impact.lower() in {"high", "very high"}
+
+        # từ khóa
+        title_up = title.upper()
+        key_ok = any(k in title_up for k in CRYPTO_KEYS)
+
+        if not (key_ok and impact_ok):
             continue
 
         out.append({
@@ -135,11 +156,11 @@ def _filter_events(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 # ====== HÀM PUBLIC CHO BOT ======
 async def fetch_macro_for_date(target_date_vn) -> List[Dict[str, Any]]:
-    """Sự kiện quan trọng của 1 ngày (giờ VN) – dữ liệu thật từ ForexFactory."""
+    """Sự kiện crypto-impact-cao của 1 ngày (giờ VN) – dữ liệu thật từ ForexFactory."""
     raw = await _fetch_ff_week()
     if not raw:
         return []
-    events = _filter_events(raw)
+    events = _filter_events_crypto_high(raw)
     return [e for e in events if e["time_vn"].date() == target_date_vn]
 
 async def fetch_macro_today() -> List[Dict[str, Any]]:
@@ -150,7 +171,7 @@ async def fetch_macro_week() -> List[Dict[str, Any]]:
     raw = await _fetch_ff_week()
     if not raw:
         return []
-    events = _filter_events(raw)
+    events = _filter_events_crypto_high(raw)
     now = datetime.now(VN_TZ)
     monday = (now - timedelta(days=now.weekday())).date()
     sunday = monday + timedelta(days=6)
