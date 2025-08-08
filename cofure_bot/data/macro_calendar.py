@@ -4,18 +4,15 @@ from typing import List, Dict, Any, Optional
 import pytz
 import os
 
-# Lấy endpoint JSON của lịch vĩ mô từ ENV (có thể để trống)
 MACRO_ENDPOINT = os.getenv("MACRO_ENDPOINT", "")
 VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 
-# Từ khóa/sự kiện quan trọng để lọc
 IMPORTANT = {
     "CPI", "Core CPI", "FOMC", "Fed", "Interest Rate",
     "Unemployment", "Non-Farm", "PPI", "GDP", "Retail Sales", "PMI"
 }
 
 def _to_vn(dt_str: str) -> Optional[datetime]:
-    """Parse chuỗi thời gian (UTC) và trả datetime theo giờ VN."""
     if not dt_str:
         return None
     fmts = ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"]
@@ -30,7 +27,6 @@ def _to_vn(dt_str: str) -> Optional[datetime]:
     return None
 
 def _vi(title: str) -> str:
-    """Dịch tiêu đề sự kiện sang TV thân thiện."""
     rep = {
         "Core CPI": "CPI lõi",
         "CPI": "Chỉ số giá tiêu dùng (CPI)",
@@ -48,21 +44,38 @@ def _vi(title: str) -> str:
         out = out.replace(k, v)
     return out or "Sự kiện vĩ mô"
 
+def _vn_to_utc_str(dt_vn: datetime) -> str:
+    return dt_vn.astimezone(pytz.utc).strftime("%Y-%m-%d %H:%M")
+
+def _mock_raw_week() -> List[Dict[str, Any]]:
+    """Sinh dữ liệu mô phỏng 1 tuần để test khi không có MACRO_ENDPOINT."""
+    now = datetime.now(VN_TZ)
+    monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    wed_cpi   = (monday + timedelta(days=2)).replace(hour=19, minute=30)  # Thứ 4 19:30
+    thu_fomc  = (monday + timedelta(days=3)).replace(hour=1,  minute=0)   # Thứ 5 01:00
+    fri_nfp   = (monday + timedelta(days=4)).replace(hour=19, minute=30)  # Thứ 6 19:30
+
+    return [
+        {"id": "cpi-us",  "time": _vn_to_utc_str(wed_cpi),  "title": "US CPI",               "impact": "high", "forecast": "", "previous": ""},
+        {"id": "fomc",    "time": _vn_to_utc_str(thu_fomc), "title": "FOMC Interest Rate",   "impact": "high", "forecast": "", "previous": ""},
+        {"id": "nfp-us",  "time": _vn_to_utc_str(fri_nfp),  "title": "US Non-Farm Payrolls", "impact": "high", "forecast": "", "previous": ""},
+    ]
+
 async def _fetch_raw() -> List[Dict[str, Any]]:
-    """Gọi endpoint JSON (nếu có). Không có → [] để bot vẫn chạy."""
     if not MACRO_ENDPOINT:
-        return []
+        # ➜ không có API thì trả mock để bạn test menu lịch
+        return _mock_raw_week()
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(MACRO_ENDPOINT, timeout=aiohttp.ClientTimeout(total=12)) as r:
                 if r.status != 200:
-                    return []
+                    return _mock_raw_week()  # fallback mock nếu API lỗi
                 return await r.json()
     except Exception:
-        return []
+        return _mock_raw_week()
 
 def _filter_events(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Chuẩn hóa + lọc theo IMPORTANT/impact cao, sort theo thời gian VN."""
     out: List[Dict[str, Any]] = []
     for e in data or []:
         t = _to_vn(str(e.get("time", "")))
@@ -82,25 +95,17 @@ def _filter_events(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out.sort(key=lambda x: x["time_vn"])
     return out
 
-# ====== HÀM PUBLIC CHO BOT ======
 async def fetch_macro_for_date(target_date_vn) -> List[Dict[str, Any]]:
-    """Sự kiện quan trọng của 1 ngày (giờ VN)."""
     raw = await _fetch_raw()
-    if not raw:
-        return []
     events = _filter_events(raw)
     return [e for e in events if e["time_vn"].date() == target_date_vn]
 
 async def fetch_macro_today() -> List[Dict[str, Any]]:
-    """Sự kiện quan trọng của HÔM NAY (giờ VN)."""
     today = datetime.now(VN_TZ).date()
     return await fetch_macro_for_date(today)
 
 async def fetch_macro_week() -> List[Dict[str, Any]]:
-    """Sự kiện quan trọng của tuần hiện tại (Thứ 2→CN, giờ VN)."""
     raw = await _fetch_raw()
-    if not raw:
-        return []
     events = _filter_events(raw)
     now = datetime.now(VN_TZ)
     monday = (now - timedelta(days=now.weekday())).date()
