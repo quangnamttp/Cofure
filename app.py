@@ -1,8 +1,10 @@
+import asyncio
 import logging
 import sys
 from aiohttp import web
-from cofure_bot.config import PORT, APP_NAME, ENV, VERSION
-from cofure_bot.utils.time import fmt
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters
+from .config import APP_NAME, PORT, TELEGRAM_BOT_TOKEN
+from .handlers.commands import start, on_text
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -11,33 +13,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(APP_NAME)
 
+# -------- AIOHTTP (health endpoints) --------
 async def health(request):
-    # Endpoint cho UptimeRobot/Render health checks
-    return web.json_response({
-        "status": "ok",
-        "app": APP_NAME,
-        "env": ENV,
-        "version": VERSION,
-        "time": fmt()
-    })
+    return web.json_response({"status": "ok", "app": APP_NAME})
 
 async def info(request):
-    return web.Response(
-        text=f"{APP_NAME} {VERSION} — {ENV} — {fmt()}",
-        content_type="text/plain"
-    )
+    return web.Response(text=f"{APP_NAME} is running", content_type="text/plain")
 
-async def init_app() -> web.Application:
+async def _start_aiohttp():
     app = web.Application()
     app.router.add_get("/health", health)
     app.router.add_get("/info", info)
-    return app
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    return runner
 
-def main():
-    web.run_app(init_app(), host="0.0.0.0", port=PORT)
+# -------- Telegram (long polling) --------
+async def _start_telegram():
+    application: Application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-if __name__ == "__main__":
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Application.ALL_UPDATE_TYPES)
+    return application
+
+async def main():
+    runner = await _start_aiohttp()
+    application = await _start_telegram()
+
     try:
-        main()
-    except KeyboardInterrupt:
-        pass
+        await asyncio.Event().wait()  # giữ tiến trình 24/7
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+        await runner.cleanup()
