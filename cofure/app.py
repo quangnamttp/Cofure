@@ -30,15 +30,15 @@ async def startup():
     _application = build_bot()
     log.info("Telegram bot built")
 
-    # Schedule all cron jobs (06:00/06:55/07:00/30' signals/22:00)
+    # Schedule jobs
     schedule_all(_application)
     log.info("Scheduler initialized")
 
-    # Run Telegram polling in background (fix close loop error)
+    # Run polling in background (fix event loop error)
     _polling_task = asyncio.create_task(
         _application.run_polling(close_loop=False)
     )
-    log.info("Bot polling started")
+    log.info("Bot polling started in background")
 
 @app.on_event("shutdown")
 async def shutdown():
