@@ -71,9 +71,16 @@ async def quick_signal_metrics(session: aiohttp.ClientSession, symbol: str, inte
     last = closes[-1]
     rsi_val = rsi(closes, 14)
     ema50 = ema(closes, 50)
-    ema200 = ema(closes, 200 if len(closes) >= 200 else max(10, len(closes) - 1))
+    ema200 = ema(closes, 200 if len(closes) >= 200 else max(10, len(closes)-1))
     trend = 1 if ema50 > ema200 else -1
-    vol_ratio = (vol[-1] / (sum(vol[-20:]) / 20.0)) if len(vol) >= 20 else 1.0
+
+    # ⚙️ an toàn khi MA20 volume = 0
+    if len(vol) >= 20:
+        ma20 = sum(vol[-20:]) / 20.0
+        vol_ratio = (vol[-1] / ma20) if ma20 > 1e-12 else 0.0
+    else:
+        vol_ratio = 1.0
+
     fund = await funding_rate_latest(session, symbol)
     return {
         "last": last,
@@ -84,7 +91,6 @@ async def quick_signal_metrics(session: aiohttp.ClientSession, symbol: str, inte
         "vol_ratio": vol_ratio,
         "funding": fund,
     }
-
 # --- NEW: danh sách symbol có volume ổn định ---
 async def active_symbols(session: aiohttp.ClientSession, min_quote_volume: float = 5_000_000.0) -> List[str]:
     """
