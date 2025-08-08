@@ -10,3 +10,7 @@ services:
         value: Asia/Ho_Chi_Minh
       - key: ENV
         value: production
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_USER_ID
+        value: "5335165612"
