@@ -1,14 +1,15 @@
-import asyncio
+import aiohttp
 from telegram.ext import Application, ContextTypes
 from datetime import datetime
 import pytz
 from ..config import TELEGRAM_ALLOWED_USER_ID, TZ_NAME
 from ..signals.engine import generate_batch
+from ..data.binance_client import active_symbols
 
 VN_TZ = pytz.timezone(TZ_NAME)
 
-COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-         "DOGEUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","TONUSDT"]
+MIN_QUOTE_VOL = 5_000_000.0   # lọc cặp có volume >= 5 triệu USDT/24h
+MAX_CANDIDATES = 60           # tối đa số symbol đem đi tính để tiết kiệm API
 
 def _in_work_hours() -> bool:
     now = datetime.now(VN_TZ)
@@ -28,14 +29,18 @@ def _fmt(sig: dict) -> str:
 async def job_halfhour_signals(context: ContextTypes.DEFAULT_TYPE):
     if not _in_work_hours():
         return
-    signals = await generate_batch(COINS, count=5)
-    # Gửi gộp một tin cho gọn (5 lệnh, ngăn cách dòng trống)
+    # lấy tất cả cặp futures USDT có volume ổn định
+    async with aiohttp.ClientSession() as session:
+        syms = await active_symbols(session, min_quote_volume=MIN_QUOTE_VOL)
+    if not syms:
+        syms = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]  # fallback
+
+    candidates = syms[:MAX_CANDIDATES]
+    signals = await generate_batch(candidates, count=5)
+
     text = "\n\n".join(_fmt(s) for s in signals)
-    await context.bot.send_message(
-        chat_id=TELEGRAM_ALLOWED_USER_ID,
-        text=text
-    )
+    await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=text)
 
 def setup_jobs(app: Application):
-    # Lặp mỗi 30 phút. Bắt đầu ngay khi service chạy, job tự kiểm tra khung giờ VN.
+    # chạy mỗi 30 phút; job tự check khung giờ VN
     app.job_queue.run_repeating(job_halfhour_signals, interval=1800, first=5, name="signals_30m")
