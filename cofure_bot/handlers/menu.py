@@ -1,137 +1,86 @@
-import aiohttp
-import pytz
-from datetime import datetime, timedelta
-from telegram import Update
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import ContextTypes
+from datetime import datetime, timedelta
+import pytz
+
 from ..config import TELEGRAM_ALLOWED_USER_ID, TZ_NAME
-from ..data.macro_calendar import fetch_macro_for_date
-from ..data.binance_client import active_symbols, quick_signal_metrics
-from ..signals.engine import generate_batch
 from ..scheduler.jobs import (
-    _fmt_signal, MIN_QUOTE_VOL, MAX_CANDIDATES,
-    ALERT_FUNDING, ALERT_VOLRATIO,
-    job_morning, job_macro
+    job_morning,
+    job_macro,
+    job_halfhour_signals,
+    job_urgent_alerts,
+    job_night_summary
 )
+from ..data.macro_calendar import fetch_macro_today, fetch_macro_week
 
 VN_TZ = pytz.timezone(TZ_NAME)
 
-def _authorized(update: Update) -> bool:
-    u = update.effective_user
-    return bool(u and u.id == TELEGRAM_ALLOWED_USER_ID)
+# ====== Tạo menu chính ======
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != TELEGRAM_ALLOWED_USER_ID:
+        return
+    buttons = [
+        [KeyboardButton("📅 Lịch hôm nay"), KeyboardButton("📅 Lịch ngày mai")],
+        [KeyboardButton("📅 Lịch cả tuần")],
+        [KeyboardButton("🧪 Test tất cả tính năng (6h→22h)")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+    await update.message.reply_text("Chọn chức năng:", reply_markup=reply_markup)
 
-# ---------- LỊCH VĨ MÔ ----------
-def _fmt_events_header(day: datetime) -> str:
-    dow = day.isoweekday()
-    return f"📅 Hôm nay là Thứ {dow}, ngày {day.strftime('%d/%m/%Y')}"
+# ====== Các nút menu ======
+async def handle_menu_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
 
-def _fmt_events(day: datetime, events: list) -> str:
-    if not events:
-        return _fmt_events_header(day) + "\n\nHôm nay không có tin tức vĩ mô quan trọng.\nChúc bạn một ngày trade thật thành công nha!"
-    now = datetime.now(VN_TZ)
-    lines = [_fmt_events_header(day), "", "🧭 Lịch tin vĩ mô quan trọng:"]
-    for e in events:
-        tstr = e["time_vn"].strftime("%H:%M")
-        extra = []
-        if e.get("forecast"): extra.append(f"Dự báo {e['forecast']}")
-        if e.get("previous"): extra.append(f"Trước {e['previous']}")
-        extra_str = (" — " + ", ".join(extra)) if extra else ""
-        left = e["time_vn"] - now
-        if left.total_seconds() > 0:
-            h = int(left.total_seconds() // 3600)
-            m = int((left.total_seconds() % 3600)//60)
-            countdown = f" — ⏳ còn {h} giờ {m} phút" if h else f" — ⏳ còn {m} phút"
+    if text == "📅 Lịch hôm nay":
+        events = await fetch_macro_today()
+        now = datetime.now(VN_TZ)
+        header = f"📅 Hôm nay là Thứ {now.isoweekday()}, ngày {now.strftime('%d/%m/%Y')}"
+        if not events:
+            await update.message.reply_text(header + "\n\nHôm nay không có tin tức vĩ mô quan trọng.")
         else:
-            countdown = ""
-        lines.append(f"• {tstr} — {e['title_vi']} — Ảnh hưởng: {e['impact']}{extra_str}{countdown}")
-    lines.append("\n💡 Gợi ý: Đứng ngoài 5–10’ quanh giờ ra tin; quan sát funding/volume.")
-    return "\n".join(lines)
+            lines = [header, "", "🧭 Lịch tin vĩ mô quan trọng:"]
+            for e in events:
+                tstr = e["time_vn"].strftime("%H:%M")
+                extra = []
+                if e.get("forecast"): extra.append(f"Dự báo {e['forecast']}")
+                if e.get("previous"): extra.append(f"Trước {e['previous']}")
+                extra_str = (" — " + ", ".join(extra)) if extra else ""
+                lines.append(f"• {tstr} — {e['title_vi']} — Ảnh hưởng: {e['impact']}{extra_str}")
+            await update.message.reply_text("\n".join(lines))
 
-async def lich_hom_nay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update): return
-    day = datetime.now(VN_TZ)
-    events = await fetch_macro_for_date(day.date())
-    await update.message.reply_text(_fmt_events(day, events))
+    elif text == "📅 Lịch ngày mai":
+        tomorrow = datetime.now(VN_TZ) + timedelta(days=1)
+        events = await fetch_macro_today(tomorrow)
+        header = f"📅 Ngày mai: {tomorrow.strftime('%d/%m/%Y')}"
+        if not events:
+            await update.message.reply_text(header + "\n\nKhông có tin tức vĩ mô quan trọng.")
+        else:
+            lines = [header, "", "🧭 Lịch tin vĩ mô quan trọng:"]
+            for e in events:
+                tstr = e["time_vn"].strftime("%H:%M")
+                lines.append(f"• {tstr} — {e['title_vi']} — Ảnh hưởng: {e['impact']}")
+            await update.message.reply_text("\n".join(lines))
 
-async def lich_ngay_mai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update): return
-    day = datetime.now(VN_TZ) + timedelta(days=1)
-    events = await fetch_macro_for_date(day.date())
-    await update.message.reply_text(_fmt_events(day, events))
+    elif text == "📅 Lịch cả tuần":
+        week_events = await fetch_macro_week()
+        if not week_events:
+            await update.message.reply_text("Không có dữ liệu lịch cả tuần.")
+        else:
+            lines = ["📅 Lịch cả tuần:"]
+            for day, events in week_events.items():
+                lines.append(f"\n=== {day} ===")
+                for e in events:
+                    tstr = e["time_vn"].strftime("%H:%M")
+                    lines.append(f"• {tstr} — {e['title_vi']} — {e['impact']}")
+            await update.message.reply_text("\n".join(lines))
 
-async def lich_ca_tuan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update): return
-    today = datetime.now(VN_TZ)
-    monday = today - timedelta(days=today.weekday())
-    texts = []
-    for i in range(7):
-        d = monday + timedelta(days=i)
-        ev = await fetch_macro_for_date(d.date())
-        texts.append(_fmt_events(d, ev))
-    await update.message.reply_text("\n\n" + ("—" * 8) + "\n\n".join(texts))
-
-# ---------- TEST FULL 06→22 ----------
-async def test_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Chạy ngay: chào sáng → lịch vĩ mô → 5 tín hiệu → (tối đa) 2 cảnh báo → mô phỏng tổng kết
-    """
-    if not _authorized(update): return
-    await update.message.reply_text("🚀 Bắt đầu test FULL: chào sáng → lịch vĩ mô → 5 tín hiệu → cảnh báo khẩn → tổng kết.")
-
-    # 1) Chào sáng + top gainers (tận dụng job_morning)
-    try:
+    elif text == "🧪 Test tất cả tính năng (6h→22h)":
+        await update.message.reply_text("🔄 Đang test tất cả tính năng...")
         await job_morning(context)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Lỗi phần chào sáng: {e}")
-
-    # 2) Lịch vĩ mô (tận dụng job_macro)
-    try:
         await job_macro(context)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Lỗi phần lịch vĩ mô: {e}")
+        await job_halfhour_signals(context)
+        await job_urgent_alerts(context)
+        await job_night_summary(context)
 
-    # 3) 5 tín hiệu RIÊNG LẺ (bỏ qua khung giờ)
-    try:
-        async with aiohttp.ClientSession() as session:
-            syms = await active_symbols(session, min_quote_volume=MIN_QUOTE_VOL)
-        if not syms:
-            syms = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]
-        sigs = await generate_batch(syms[:MAX_CANDIDATES], count=5)
-        for i, s in enumerate(sigs):
-            s["signal_type"] = "Scalping" if i < 3 else "Swing"
-            s["order_type"] = "Market"
-            await update.message.reply_text(_fmt_signal(s))
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Lỗi phần tín hiệu: {e}")
-
-    # 4) Cảnh báo khẩn (quét nhanh, tối đa 2 cảnh báo)
-    try:
-        sent = 0
-        async with aiohttp.ClientSession() as session:
-            syms = await active_symbols(session, min_quote_volume=MIN_QUOTE_VOL)
-            for sym in syms[:MAX_CANDIDATES]:
-                m = await quick_signal_metrics(session, sym, interval="5m")
-                if abs(m["funding"]) >= ALERT_FUNDING or m["vol_ratio"] >= ALERT_VOLRATIO:
-                    arrow = "▲" if m["vol_ratio"] >= ALERT_VOLRATIO else ""
-                    side_hint = "Long nghiêng" if m["funding"] > 0 else ("Short nghiêng" if m["funding"] < 0 else "Trung tính")
-                    text = (f"⏰ Cảnh báo khẩn — {sym}\n"
-                            f"• Funding: {m['funding']:.4f} ({side_hint})\n"
-                            f"• Volume 5m: x{m['vol_ratio']:.2f} {arrow}\n"
-                            f"• Gợi ý: cân nhắc {'MUA' if m['funding']>0 else 'BÁN' if m['funding']<0 else 'quan sát'} nếu ổn định thêm.")
-                    await update.message.reply_text(text)
-                    sent += 1
-                    if sent >= 2:
-                        break
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Lỗi phần cảnh báo khẩn: {e}")
-
-    # 5) Mô phỏng tổng kết
-    try:
-        await update.message.reply_text(
-            "🌒 Tổng kết phiên (mô phỏng)\n"
-            "• Tín hiệu đã gửi: ~5 (trong test)\n"
-            "• Cảnh báo khẩn: ~0–2 (trong test)\n"
-            "• Dự báo tối: Giữ kỷ luật, giảm đòn bẩy khi biến động mạnh.\n\n"
-            "🌙 Cảm ơn bạn đã đồng hành cùng Cofure hôm nay. 😴 Ngủ ngon nha!"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Lỗi phần tổng kết: {e}")
+    else:
+        await update.message.reply_text("❓ Không hiểu lệnh, vui lòng chọn từ menu.")
