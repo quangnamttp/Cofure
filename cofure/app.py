@@ -17,6 +17,11 @@ app = FastAPI()
 def health():
     return {"ok": True}
 
+# NEW: root route để khỏi 404 khi mở trang chủ
+@app.get("/")
+def home():
+    return {"message": "Cofure bot is running!"}
+
 _application = None  # telegram Application
 
 @app.on_event("startup")
@@ -24,15 +29,14 @@ async def startup():
     global _application
     log.info("Starting Cofure app…")
 
-    # Build Telegram bot
     _application = build_bot()
     log.info("Telegram bot built")
 
-    # Schedule cron jobs (06:00 / 06:55 / 07:00 / mỗi 30’ / 22:00)
+    # Lịch cron (06:00 / 06:55 / 07:00 / mỗi 30' / 22:00)
     schedule_all(_application)
     log.info("Scheduler initialized")
 
-    # KHÔNG dùng run_polling để tránh đóng/chiếm event loop của uvicorn
+    # Không dùng run_polling để tránh chiếm/đóng event loop của uvicorn
     await _application.initialize()
     await _application.start()
     log.info("Telegram application started")
