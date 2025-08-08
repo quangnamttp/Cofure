@@ -26,17 +26,19 @@ async def startup():
     global _application, _polling_task
     log.info("Starting Cofure app…")
 
-    _application = build_bot()              # tạo Application (PTB)
+    # Tạo Telegram Application
+    _application = build_bot()
     log.info("Telegram bot built")
 
-    schedule_all(_application)              # gắn scheduler
+    # Gắn scheduler (06:00 / 06:55 / 07:00 / mỗi 30’ / 22:00)
+    schedule_all(_application)
     log.info("Scheduler initialized")
 
-    # QUAN TRỌNG: chạy polling ở background + không đóng event loop
+    # CHẠY POLLING Ở BACKGROUND + không đóng event loop của uvicorn
     _polling_task = asyncio.create_task(
         _application.run_polling(close_loop=False)
     )
-    log.info("Bot polling started")
+    log.info("Bot polling started (background)")
 
 @app.on_event("shutdown")
 async def shutdown():
