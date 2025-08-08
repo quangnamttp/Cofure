@@ -6,7 +6,7 @@ from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters
 from .config import APP_NAME, PORT, TELEGRAM_BOT_TOKEN, PUBLIC_BASE_URL
 from .handlers.commands import start, on_text
-from .scheduler.jobs import setup_jobs  # <-- thêm import này
+from .scheduler.jobs import setup_jobs  # job 30'
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -17,7 +17,6 @@ logger = logging.getLogger(APP_NAME)
 
 # -------- AIOHTTP (endpoints) --------
 async def index(request):
-    # Cho UptimeRobot ping domain gốc
     return web.json_response({"status": "ok", "app": APP_NAME})
 
 async def health(request):
@@ -27,7 +26,6 @@ async def info(request):
     return web.Response(text=f"{APP_NAME} is running", content_type="text/plain")
 
 async def webhook_handler(request):
-    # Nhận update từ Telegram và đẩy vào hàng đợi của Application
     data = await request.json()
     application: Application = request.app["application"]
     update = Update.de_json(data, application.bot)
@@ -36,7 +34,7 @@ async def webhook_handler(request):
 
 async def _start_aiohttp(application: Application):
     app = web.Application()
-    app["application"] = application  # để webhook handler truy cập
+    app["application"] = application
     app.router.add_get("/", index)
     app.router.add_get("/health", health)
     app.router.add_get("/info", info)
@@ -57,7 +55,7 @@ async def _start_telegram_webhook() -> Application:
     await application.initialize()
     await application.start()
 
-    webhook_url = f"{PUBLIC_BASE_URL}/webhook"
+    webhook_url = f"{PUBLIC_BASE_URL.rstrip('/')}/webhook"  # tránh //webhook
     await application.bot.set_webhook(webhook_url)
     logger.info("Webhook set to %s", webhook_url)
     return application
@@ -69,11 +67,11 @@ async def main():
     # Đăng ký lịch gửi tín hiệu 30'
     setup_jobs(application)
 
-    # Khởi động web server aiohttp (health + webhook endpoint)
+    # Khởi động web server aiohttp (health + webhook)
     runner = await _start_aiohttp(application)
 
     try:
-        await asyncio.Event().wait()  # giữ tiến trình 24/7
+        await asyncio.Event().wait()
     finally:
         await application.stop()
         await application.shutdown()
