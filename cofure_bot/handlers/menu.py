@@ -1,3 +1,5 @@
+# cofure_bot/handlers/menu.py
+
 import aiohttp
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -20,10 +22,20 @@ def _authorized(update: Update) -> bool:
     u = update.effective_user
     return bool(u and u.id == TELEGRAM_ALLOWED_USER_ID)
 
-# ===== Helpers: format lịch vĩ mô =====
+# ===== Helpers: tên thứ & format lịch =====
+def _day_name_vi(d: datetime) -> str:
+    return {
+        1: "Thứ 2",
+        2: "Thứ 3",
+        3: "Thứ 4",
+        4: "Thứ 5",
+        5: "Thứ 6",
+        6: "Thứ 7",
+        7: "Chủ nhật",
+    }[d.isoweekday()]
+
 def _fmt_events_header(day: datetime) -> str:
-    dow = day.isoweekday()  # 1..7
-    return f"📅 Thứ {dow}, ngày {day.strftime('%d/%m/%Y')}"
+    return f"📅 {_day_name_vi(day)}, ngày {day.strftime('%d/%m/%Y')}"
 
 def _fmt_events(day: datetime, events: list) -> str:
     if not events:
@@ -36,7 +48,6 @@ def _fmt_events(day: datetime, events: list) -> str:
         if e.get("forecast"): extra.append(f"Dự báo {e['forecast']}")
         if e.get("previous"): extra.append(f"Trước {e['previous']}")
         extra_str = (" — " + ", ".join(extra)) if extra else ""
-        # đếm ngược
         left = e["time_vn"] - now
         if left.total_seconds() > 0:
             h = int(left.total_seconds() // 3600)
@@ -52,7 +63,7 @@ def _fmt_events(day: datetime, events: list) -> str:
 async def lich_hom_nay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update): return
     day = datetime.now(VN_TZ)
-    events = await fetch_macro_for_date(day.date())
+    events = await fetch_macro_for_date(day.date())  # đã lọc crypto + impact cao trong macro_calendar.py
     await update.message.reply_text(_fmt_events(day, events))
 
 async def lich_ngay_mai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -62,24 +73,14 @@ async def lich_ngay_mai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_fmt_events(day, events))
 
 async def lich_ca_tuan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gửi 7 tin riêng: Thứ 2 → Chủ nhật (không bị cắt)."""
     if not _authorized(update): return
     today = datetime.now(VN_TZ)
     monday = today - timedelta(days=today.weekday())  # Thứ 2 tuần hiện tại
-    texts = []
     for i in range(7):
         d = monday + timedelta(days=i)
         ev = await fetch_macro_for_date(d.date())
-        texts.append(_fmt_events(d, ev))
-    # Ngăn tin quá dài: gửi theo từng ngày, hoặc gộp nhẹ
-    chunk = "\n\n" + ("—" * 8) + "\n\n"
-    joined = chunk.join(texts)
-    # Telegram giới hạn 4096 ký tự mỗi tin -> chia nhỏ nếu cần
-    while joined:
-        part = joined[:3500]
-        cut = part.rfind("\n")
-        if cut == -1: cut = len(part)
-        await update.message.reply_text(part[:cut])
-        joined = joined[cut:].lstrip("\n")
+        await update.message.reply_text(_fmt_events(d, ev))
 
 async def test_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -89,13 +90,13 @@ async def test_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update): return
     await update.message.reply_text("🚀 Bắt đầu test FULL: chào sáng → lịch vĩ mô → 5 tín hiệu → cảnh báo khẩn → tổng kết.")
 
-    # 1) Chào buổi sáng + top gainers (tận dụng job sẵn)
+    # 1) Chào buổi sáng + top gainers
     try:
         await job_morning(context)
     except Exception as e:
         await update.message.reply_text(f"⚠️ Lỗi phần chào sáng: {e}")
 
-    # 2) Lịch vĩ mô hôm nay (tận dụng job sẵn)
+    # 2) Lịch vĩ mô hôm nay (crypto + impact cao)
     try:
         await job_macro(context)
     except Exception as e:
