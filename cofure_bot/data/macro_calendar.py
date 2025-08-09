@@ -1,5 +1,3 @@
-# cofure_bot/data/macro_calendar.py
-
 import aiohttp
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
@@ -12,34 +10,34 @@ FF_THISWEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 # Từ khóa sự kiện quan trọng tác động mạnh tới crypto (so khớp chữ IN HOA)
 CRYPTO_KEYS = {
-    # Lạm phát & tiêu dùng
-    "CPI", "CORE CPI", "CPI Y/Y", "CPI M/M",
-    "PCE", "CORE PCE", "PCE Y/Y", "PCE M/M",
-    "PPI", "CORE PPI", "PPI Y/Y", "PPI M/M",
-    # Việc làm
-    "UNEMPLOYMENT", "UNEMPLOYMENT RATE", "JOBLESS", "NON-FARM", "NFP", "PAYROLLS",
-    # Lãi suất & họp báo
-    "INTEREST RATE", "RATE DECISION", "RATE STATEMENT", "PRESS CONFERENCE",
-    "FOMC", "FED", "DOT PLOT",
-    # Tăng trưởng & hoạt động
-    "GDP", "RETAIL SALES", "ISM", "PMI"
+    "CPI", "CORE CPI",
+    "PCE", "CORE PCE",
+    "FOMC", "FED",
+    "INTEREST RATE", "RATE DECISION", "PRESS CONFERENCE",
+    "UNEMPLOYMENT", "UNEMPLOYMENT RATE",
+    "NON-FARM", "NFP",
+    "PPI", "GDP", "RETAIL SALES",
+    "ISM", "PMI"
 }
 
 IMPACT_MAP = {1: "Low", 2: "Medium", 3: "High", 4: "Holiday"}
 
 def _parse_dt_any(v: Any) -> Optional[datetime]:
     """
-    Parse các kiểu thời gian mà FF có thể trả:
-    - timestamp (s hoặc ms)
-    - ISO8601 (2025-08-08T12:30:00Z / ...+00:00)
+    Cố gắng parse mọi kiểu thời gian FF trả:
+    - 'timestamp' (s hoặc ms)
+    - ISO8601 string ('2025-08-08T12:30:00Z' / '...+00:00')
+    - 'date' + 'time' (ít gặp)
     """
     if v is None:
         return None
+    # số: timestamp (s hoặc ms)
     if isinstance(v, (int, float)):
         ts = float(v)
         if ts > 1e12:  # ms
             ts = ts / 1000.0
         return datetime.fromtimestamp(ts, tz=timezone.utc)
+    # chuỗi ISO
     if isinstance(v, str):
         s = v.strip()
         if s.endswith("Z"):
@@ -59,32 +57,27 @@ def _to_vn(dt_utc: datetime) -> datetime:
     return dt_utc.astimezone(VN_TZ)
 
 def _norm_impact(raw: Any) -> str:
-    """
-    FF có thể trả impact dưới dạng số, chuỗi hoặc object.
-    Trả về label chuẩn hóa: Low / Medium / High / Holiday / Very High (nếu có).
-    """
+    """FF có thể trả impact dưới dạng số, chuỗi, hoặc object."""
     if raw is None:
         return ""
     if isinstance(raw, (int, float)):
         return IMPACT_MAP.get(int(raw), str(raw))
     if isinstance(raw, str):
-        lab = raw.strip().title()
-        # Nhiều feed dùng 'High' / 'Medium' / 'Low' — hoặc 'High Impact Expected'
-        if "High" in lab and "Very" in lab:
-            return "Very High"
-        if "High" in lab and "Very" not in lab:
-            return "High"
-        if "Medium" in lab:
-            return "Medium"
-        if "Low" in lab:
-            return "Low"
-        if "Holiday" in lab:
-            return "Holiday"
-        return lab
+        return raw.capitalize()
     if isinstance(raw, dict):
-        lab = raw.get("label") or IMPACT_MAP.get(raw.get("value"), "")
-        return _norm_impact(lab)
+        # một số feed có { "impact": { "value": 3, "label": "High" } }
+        return raw.get("label") or IMPACT_MAP.get(raw.get("value"), "")
     return str(raw)
+
+def _clean_field(v: Any) -> str:
+    """Chuẩn hoá các field số/chuỗi: bỏ khoảng trắng thừa, giữ % nếu có."""
+    if v is None:
+        return ""
+    s = str(v).strip()
+    # ForexFactory đôi khi cho "N/A" / "" -> quy về ""
+    if s.upper() in {"NA", "N/A", "-"}:
+        return ""
+    return s
 
 def _vi(title: str) -> str:
     rep = {
@@ -92,24 +85,20 @@ def _vi(title: str) -> str:
         "CPI": "Chỉ số giá tiêu dùng (CPI)",
         "Core PCE": "PCE lõi",
         "PCE": "Chi tiêu tiêu dùng cá nhân (PCE)",
-        "Core PPI": "PPI lõi",
-        "PPI": "Chỉ số giá sản xuất (PPI)",
         "Interest Rate": "Quyết định lãi suất",
         "Rate Decision": "Quyết định lãi suất",
-        "Rate Statement": "Tuyên bố lãi suất",
         "Press Conference": "Họp báo",
         "Unemployment Rate": "Tỷ lệ thất nghiệp",
-        "Unemployment": "Thất nghiệp",
-        "Jobless": "Thất nghiệp",
+        "Unemployment": "Tỷ lệ thất nghiệp",
         "Non-Farm": "Bảng lương phi nông nghiệp (NFP)",
         "NFP": "Bảng lương phi nông nghiệp (NFP)",
         "Retail Sales": "Doanh số bán lẻ",
         "GDP": "Tổng sản phẩm quốc nội (GDP)",
+        "PPI": "Chỉ số giá sản xuất (PPI)",
         "FOMC": "FOMC",
         "PMI": "PMI",
         "ISM": "Chỉ số ISM",
         "Fed": "Fed",
-        "Dot Plot": "Biểu đồ điểm (Dot Plot)",
     }
     out = title or ""
     for k, v in rep.items():
@@ -127,12 +116,30 @@ async def _fetch_ff_week() -> List[Dict[str, Any]]:
     except Exception:
         return []
 
+def _pick_actual(e: Dict[str, Any]) -> str:
+    """
+    Lấy 'actual' từ nhiều khả năng key:
+    - e['actual'], e['value'], e['result'], e['release']
+    Một số schema đóng gói trong object: {'actual': {'value': '0.3%'}}.
+    """
+    cands = ["actual", "value", "result", "release"]
+    for k in cands:
+        v = e.get(k)
+        if isinstance(v, dict):
+            # lấy 'value'/'text' nếu có
+            vv = v.get("value") or v.get("text")
+            if vv:
+                return _clean_field(vv)
+        if v not in (None, ""):
+            return _clean_field(v)
+    return ""
+
 def _filter_events_crypto_high(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Giữ sự kiện:
       - Thuộc nhóm từ khóa CRYPTO_KEYS (bắt buộc)
       - Impact cao: High / Very High (bắt buộc)
-    Chuẩn hoá field, quy đổi giờ VN, và giữ thêm 'title' gốc + 'actual' + 'country'.
+    Chuẩn hóa field và quy đổi giờ VN. Ghi chú thêm title_en và actual.
     """
     out: List[Dict[str, Any]] = []
     for e in raw or []:
@@ -142,10 +149,10 @@ def _filter_events_crypto_high(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
         # thời gian
         dt_utc = (
-            _parse_dt_any(e.get("timestamp"))
-            or _parse_dt_any(e.get("dateTime"))
-            or _parse_dt_any(e.get("date"))
-            or _parse_dt_any(e.get("updated"))
+            _parse_dt_any(e.get("timestamp")) or
+            _parse_dt_any(e.get("dateTime")) or
+            _parse_dt_any(e.get("date")) or
+            _parse_dt_any(e.get("updated"))
         )
         if not dt_utc:
             continue
@@ -162,16 +169,20 @@ def _filter_events_crypto_high(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]
         if not (key_ok and impact_ok):
             continue
 
+        # số liệu
+        forecast = _clean_field(e.get("forecast") or e.get("consensus") or e.get("expected"))
+        previous = _clean_field(e.get("previous") or e.get("prior"))
+        actual   = _pick_actual(e)
+
         out.append({
             "id": str(e.get("id") or f"{title}-{int(t_vn.timestamp())}"),
             "time_vn": t_vn,
-            "title": title,                  # EN gốc (phục vụ phân tích)
-            "title_vi": _vi(title),          # bản Việt để hiển thị
+            "title_en": title,             # ⬅️ giữ bản gốc tiếng Anh để bias chuẩn
+            "title_vi": _vi(title),
             "impact": impact,
-            "forecast": str(e.get("forecast") or e.get("consensus") or ""),
-            "previous": str(e.get("previous") or ""),
-            "actual": str(e.get("actual") or ""),        # <-- BỔ SUNG: để post-analysis
-            "country": str(e.get("country") or ""),      # tuỳ lúc có/không
+            "forecast": forecast,
+            "previous": previous,
+            "actual": actual,              # ⬅️ thêm actual
         })
     out.sort(key=lambda x: x["time_vn"])
     return out
