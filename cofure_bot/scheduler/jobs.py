@@ -57,6 +57,18 @@ URGENT_ENTRY_SLIPPAGE_MAX  = 0.003 # |entry - last|/last <= 0.3% (vào ngay)
 _pre_announced = set()   # id@-30/-15/-05
 _post_reported  = set()  # id sau tin
 
+# ========= CANH MỐC THỜI GIAN LẦN CHẠY ĐẦU =========
+def _next_at(min_interval: int) -> datetime:
+    """
+    Trả về thời điểm VN gần nhất rơi đúng bội số của min_interval phút
+    (ví dụ 30 -> 00/30; 10 -> 00/10/20/30/40/50).
+    """
+    now = datetime.now(VN_TZ).replace(second=0, microsecond=0)
+    delta_min = (min_interval - (now.minute % min_interval)) % min_interval
+    if delta_min == 0:
+        delta_min = min_interval
+    return now + timedelta(minutes=delta_min)
+
 # ========= TIỆN ÍCH =========
 def _in_work_hours() -> bool:
     now = datetime.now(VN_TZ)
@@ -91,9 +103,9 @@ def _fmt_signal(sig: dict) -> str:
 def _macro_bias(event_title_en: str, actual: str, forecast: str, previous: str) -> str:
     t = (event_title_en or "").lower()
     def num(x):
-       try: 
+       try:
            return float(str(x).replace('%','').replace(',','').strip())
-       except: 
+       except:
            return None
     a, f, p = num(actual), num(forecast), num(previous)
 
@@ -265,7 +277,7 @@ async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
                 fd = abs(float(mq.get("funding") or 0.0))
 
                 # Sơ bộ
-                if (fd < ALERT_FUNDING) and (vr < ALERT_VOLRATIO): 
+                if (fd < ALERT_FUNDING) and (vr < ALERT_VOLRATIO):
                     continue
 
                 # Tính chi tiết
@@ -273,9 +285,9 @@ async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
                 score = _urgent_score(ret15m_abs, z_vol, abs_funding)
 
                 # Rào cứng “rất tự tin”
-                if vr < URGENT_VOLRATIO_MIN or vr > URGENT_VOLRATIO_MAX: 
+                if vr < URGENT_VOLRATIO_MIN or vr > URGENT_VOLRATIO_MAX:
                     continue
-                if abs_funding < URGENT_FUNDING_MIN: 
+                if abs_funding < URGENT_FUNDING_MIN:
                     continue
 
                 # Yêu cầu trend align
@@ -285,7 +297,6 @@ async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
                     ema200 = float(m.get("ema200") or last)
                     trend_long  = last > ema50 > ema200
                     trend_short = last < ema50 < ema200
-                    # nếu không rõ trend thì bỏ
                     if not (trend_long or trend_short):
                         continue
 
@@ -344,7 +355,7 @@ async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 continue
 
-        if not final: 
+        if not final:
             return
 
         # Chỉ gửi 1 tin “combo” + ghim mới, gỡ ghim cũ
@@ -488,16 +499,37 @@ def setup_jobs(app: Application):
         jq.start()
         app.job_queue = jq
 
+    # Daily cố định giờ VN
     jq.run_daily(job_morning,       time=dt.time(hour=6,  minute=0, tzinfo=VN_TZ), name="morning_0600")
     jq.run_daily(job_macro,         time=dt.time(hour=7,  minute=0, tzinfo=VN_TZ), name="macro_0700")
+    jq.run_daily(job_night_summary, time=dt.time(hour=22, minute=0, tzinfo=VN_TZ), name="summary_2200")
 
-    jq.run_repeating(job_halfhour_signals, interval=1800, first=5,  name="signals_30m")
+    # Repeating: căn mốc chuẩn ngay từ lần đầu
+    jq.run_repeating(
+        job_halfhour_signals,
+        interval=1800,                 # 30 phút
+        first=_next_at(30),            # chạy đúng 00/30
+        name="signals_30m"
+    )
 
-    # Khẩn: 10 phút/lần, nhưng do bộ lọc siết mạnh nên sẽ rất hạn chế
-    jq.run_repeating(job_urgent_alerts,    interval=600,  first=15, name="alerts_10m")
+    # Khẩn: 10 phút/lần, lọc siết mạnh
+    jq.run_repeating(
+        job_urgent_alerts,
+        interval=600,                  # 10 phút
+        first=_next_at(10),            # chạy đúng 00/10/20/30/40/50
+        name="alerts_10m"
+    )
 
     # Phân tích lịch: 5 phút/lần
-    jq.run_repeating(job_macro_watch_pre,  interval=300,  first=20, name="macro_pre_5m")
-    jq.run_repeating(job_macro_watch_post, interval=300,  first=50, name="macro_post_5m")
-
-    jq.run_daily(job_night_summary, time=dt.time(hour=22, minute=0, tzinfo=VN_TZ), name="summary_2200")
+    jq.run_repeating(
+        job_macro_watch_pre,
+        interval=300,                  # 5 phút
+        first=_next_at(5),             # chạy đúng 00/05/10/...
+        name="macro_pre_5m"
+    )
+    jq.run_repeating(
+        job_macro_watch_post,
+        interval=300,                  # 5 phút
+        first=_next_at(5),
+        name="macro_post_5m"
+    )
