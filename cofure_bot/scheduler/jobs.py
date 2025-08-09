@@ -46,8 +46,11 @@ _pre_announced = set()   # id + marker từng mốc (id@-30, id@-15, id@-05)
 _post_reported  = set()  # id đã báo sau tin
 
 # ========= TIỆN ÍCH =========
+def _now_vn() -> datetime:
+    return datetime.now(VN_TZ)
+
 def _in_work_hours() -> bool:
-    now = datetime.now(VN_TZ)
+    now = _now_vn()
     return WORK_START <= now.hour < WORK_END
 
 def _day_name_vi(d: datetime) -> str:
@@ -77,16 +80,12 @@ def _fmt_signal(sig: dict) -> str:
 
 # ====== Heuristic bias theo loại tin ======
 def _macro_bias(event_title_en: str, actual: str, forecast: str, previous: str) -> str:
-    """
-    Gợi ý bias chung cho crypto (risk-on/risk-off) dựa vào loại tin & Actual vs Forecast.
-    """
     t = (event_title_en or "").lower()
     def num(x):
         try:
             return float(str(x).replace('%','').replace(',','').strip())
         except:
             return None
-
     a, f, p = num(actual), num(forecast), num(previous)
 
     if "cpi" in t or "pce" in t or "ppi" in t or "inflation" in t:
@@ -112,12 +111,9 @@ def _macro_bias(event_title_en: str, actual: str, forecast: str, previous: str) 
     if "interest rate" in t or "fomc" in t or "rate decision" in t or "fed" in t:
         if actual:
             at = actual.lower()
-            if "cut" in at:
-                return "✅ Nghiêng Risk-on (cắt lãi)"
-            if "hike" in at or "+" in at:
-                return "⚠️ Nghiêng Risk-off (tăng lãi)"
-            if "hold" in at or at == previous:
-                return "ℹ️ Trung tính (giữ nguyên)"
+            if "cut" in at: return "✅ Nghiêng Risk-on (cắt lãi)"
+            if "hike" in at or "+" in at: return "⚠️ Nghiêng Risk-off (tăng lãi)"
+            if "hold" in at or at == previous: return "ℹ️ Trung tính (giữ nguyên)"
         return "ℹ️ Chờ chi tiết quyết định & họp báo"
 
     if "retail sales" in t or "pmi" in t or "ism" in t or "gdp" in t:
@@ -168,7 +164,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
 # ========= 07:00 — Lịch vĩ mô hôm nay =========
 async def job_macro(context: ContextTypes.DEFAULT_TYPE):
     events = await fetch_macro_today()
-    now = datetime.now(VN_TZ)
+    now = _now_vn()
     header = f"📅 {_day_name_vi(now)}, ngày {now.strftime('%d/%m/%Y')}"
     if not events:
         await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID,
@@ -319,37 +315,36 @@ async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
 
 # ========= PHÂN TÍCH LÚC RA TIN — TRƯỚC GIỜ =========
 async def job_macro_watch_pre(context: ContextTypes.DEFAULT_TYPE):
-    """Báo trước giờ ra tin 30', 15', 5' + snapshot BTC/ETH (dung sai ±2')."""
+    """Báo trước giờ ra tin 30', 15', 5' + snapshot BTC/ETH."""
     events = await fetch_macro_week()
     if not events: return
-    now = datetime.now(VN_TZ)
+    now = _now_vn()
 
     checkpoints = [30, 15, 5]  # phút
     targets = []
     for e in events:
-        dt_ev = e["time_vn"]
-        delta_min = int((dt_ev - now).total_seconds() // 60)
-        if delta_min < 0:
-            continue
+        delta_min = int((e["time_vn"] - now).total_seconds() // 60)
         for cp in checkpoints:
-            # chạy mỗi 5', cho phép dung sai ±2'
-            if abs(delta_min - cp) <= 2:
+            if delta_min == cp:
                 key = f"{e['id']}@-{cp}"
                 if key not in _pre_announced:
                     targets.append((e, cp, key))
+
     if not targets: return
 
     async with aiohttp.ClientSession() as session:
         def fmt_snap(sym, m):
             return f"{sym}: funding {m.get('funding',0):.4f} | Vol5m x{(m.get('vol_ratio') or 1.0):.2f}"
+
         for e, cp, key in targets:
             try:
                 btc = await quick_signal_metrics(session, "BTCUSDT", interval="5m")
                 eth = await quick_signal_metrics(session, "ETHUSDT", interval="5m")
             except Exception:
                 btc = {}; eth = {}
-            # dùng title_en để bias chuẩn
-            bias = _macro_bias(e.get("title_en") or "", e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
+
+            bias = _macro_bias(e.get("title_en") or e.get("title") or "",
+                               e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
 
             lines = [
                 f"⏳ {cp} phút nữa ra tin: <b>{e['title_vi']}</b>",
@@ -377,15 +372,16 @@ async def job_macro_watch_post(context: ContextTypes.DEFAULT_TYPE):
     """Sau tin (≤15’), nếu có 'actual' thì so sánh Actual vs Forecast/Previous + snapshot BTC/ETH + bias."""
     events = await fetch_macro_week()
     if not events: return
-    now = datetime.now(VN_TZ)
+    now = _now_vn()
 
     candidates = []
     for e in events:
-        dt_ev = e["time_vn"]
-        secs = (now - dt_ev).total_seconds()
-        if 0 <= secs <= 15*60:
-            if e.get("actual") and e["id"] not in _post_reported:
-                candidates.append(e)
+        dtv = e["time_vn"]
+        if 0 <= (now - dtv).total_seconds() <= 15*60:
+            if e.get("actual"):
+                if e["id"] not in _post_reported:
+                    candidates.append(e)
+
     if not candidates: return
 
     async with aiohttp.ClientSession() as session:
@@ -396,7 +392,8 @@ async def job_macro_watch_post(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 btc = {}; eth = {}
 
-            bias = _macro_bias(e.get("title_en") or "", e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
+            bias = _macro_bias(e.get("title_en") or e.get("title") or "",
+                               e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
 
             lines = [
                 f"🛎️ <b>Kết quả vừa công bố:</b> {e['title_vi']}",
@@ -436,6 +433,24 @@ async def job_night_summary(context: ContextTypes.DEFAULT_TYPE):
     )
     await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=text)
 
+# ========= HELPERS: CĂN GIỜ CỐ ĐỊNH THEO ĐỒNG HỒ =========
+def _next_at_minute(minute: int, second: int = 0) -> datetime:
+    """Trả về datetime (VN_TZ) lần kế tiếp ở phút=minute, giây=second."""
+    now = _now_vn()
+    cand = now.replace(minute=minute, second=second, microsecond=0)
+    if cand <= now:
+        cand += timedelta(hours=1)
+    return cand
+
+def _next_every_k_minutes(k: int, second: int = 0) -> datetime:
+    """Trả về datetime (VN_TZ) lần kế tiếp tại mốc phút bội số của k."""
+    now = _now_vn()
+    next_min = ((now.minute // k) + 1) * k
+    cand = now.replace(minute=0, second=second, microsecond=0) + timedelta(minutes=next_min, hours=0)
+    if cand <= now:
+        cand += timedelta(minutes=k)
+    return cand
+
 # ========= ĐĂNG KÝ JOB =========
 def setup_jobs(app: Application):
     jq = app.job_queue
@@ -445,16 +460,18 @@ def setup_jobs(app: Application):
         jq.start()
         app.job_queue = jq
 
-    jq.run_daily(job_morning,       time=dt.time(hour=6,  minute=0, tzinfo=VN_TZ), name="morning_0600")
-    jq.run_daily(job_macro,         time=dt.time(hour=7,  minute=0, tzinfo=VN_TZ), name="macro_0700")
-
-    jq.run_repeating(job_halfhour_signals, interval=1800, first=5,  name="signals_30m")
-
-    # Tin khẩn: 10 phút/lần (đã có cooldown 3h/coin + cap 3 tin/giờ)
-    jq.run_repeating(job_urgent_alerts,    interval=600,  first=15, name="alerts_10m")
-
-    # Phân tích lịch: 5 phút/lần (dung sai ±2' trong job_macro_watch_pre)
-    jq.run_repeating(job_macro_watch_pre,  interval=300,  first=20, name="macro_pre_5m")
-    jq.run_repeating(job_macro_watch_post, interval=300,  first=50, name="macro_post_5m")
-
+    # Hàng ngày theo giờ cố định
+    jq.run_daily(job_morning, time=dt.time(hour=6, minute=0, tzinfo=VN_TZ), name="morning_0600")
+    jq.run_daily(job_macro,   time=dt.time(hour=7, minute=0, tzinfo=VN_TZ), name="macro_0700")
     jq.run_daily(job_night_summary, time=dt.time(hour=22, minute=0, tzinfo=VN_TZ), name="summary_2200")
+
+    # Tín hiệu 30 phút — CHẠY ĐÚNG MỐC :00 và :30
+    jq.run_repeating(job_halfhour_signals, interval=3600, first=_next_at_minute(0, 0),  name="signals_at_00")
+    jq.run_repeating(job_halfhour_signals, interval=3600, first=_next_at_minute(30, 0), name="signals_at_30")
+
+    # Tin khẩn: 10 phút/lần, căn mốc phút % 10 == 0
+    jq.run_repeating(job_urgent_alerts, interval=600, first=_next_every_k_minutes(10, 0), name="alerts_10m")
+
+    # Phân tích lịch: 5 phút/lần, căn mốc phút % 5 == 0
+    jq.run_repeating(job_macro_watch_pre,  interval=300, first=_next_every_k_minutes(5, 0),  name="macro_pre_5m")
+    jq.run_repeating(job_macro_watch_post, interval=300, first=_next_every_k_minutes(5, 0),  name="macro_post_5m")
