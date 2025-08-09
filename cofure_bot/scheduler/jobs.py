@@ -19,38 +19,47 @@ from cofure_bot.storage.state import (
 
 VN_TZ = pytz.timezone(TZ_NAME)
 
-# ========= NGƯỠNG & CẤU HÌNH =========
+# ========= NGƯỠNG & CẤU HÌNH CƠ BẢN =========
 MIN_QUOTE_VOL   = 5_000_000.0
 MAX_CANDIDATES  = 60
 
 WORK_START      = 6
 WORK_END        = 22
 
+# Ngưỡng sơ bộ để rà khẩn
 ALERT_FUNDING   = 0.02
 ALERT_VOLRATIO  = 1.8
 
-ALERT_COOLDOWN_MIN   = 180
-ALERT_TOPK           = 2
-ALERT_MAX_PER_RUN    = 3
+# Tần suất/giới hạn khẩn
+ALERT_COOLDOWN_MIN   = 180      # 3 tiếng/coin
+ALERT_TOPK           = 1        # chỉ lấy 1 coin tốt nhất/lượt
+ALERT_MAX_PER_RUN    = 1        # gửi 1 tin duy nhất/lượt để thật “sạch”
 ALERT_SCORE_MIN      = 3.0
-ALERT_PER_HOUR_MAX   = 3
+ALERT_PER_HOUR_MAX   = 2        # mỗi giờ tối đa 2 tin khẩn
 PIN_URGENT           = True
 
+# Bỏ cooldown nếu cực mạnh
 ALERT_STRONG_VOLRATIO = 3.0
 ALERT_SCORE_STRONG    = 6.0
 
+# Sao cho tín hiệu định kỳ
 STAR_SCORE_THRESHOLD  = 5.0
 
+# ========= NGƯỠNG “VÀO NGAY” CỰC CHẶT CHO KHẨN =========
+URGENT_VOLRATIO_MIN        = 2.5   # vol bùng nổ tối thiểu
+URGENT_FUNDING_MIN         = 0.03  # |funding| tối thiểu
+URGENT_VOLRATIO_MAX        = 6.0   # quá hỗn loạn thì bỏ
+URGENT_REQUIRE_TREND_ALIGN = True  # yêu cầu xu hướng cùng chiều
+URGENT_MIN_RR              = 1.50  # yêu cầu Risk/Reward tối thiểu
+URGENT_ENTRY_SLIPPAGE_MAX  = 0.003 # |entry - last|/last <= 0.3% (vào ngay)
+
 # ====== CACHE đơn giản cho phân tích lịch ======
-_pre_announced = set()   # id + marker từng mốc (id@-30, id@-15, id@-05)
-_post_reported  = set()  # id đã báo sau tin
+_pre_announced = set()   # id@-30/-15/-05
+_post_reported  = set()  # id sau tin
 
 # ========= TIỆN ÍCH =========
-def _now_vn() -> datetime:
-    return datetime.now(VN_TZ)
-
 def _in_work_hours() -> bool:
-    now = _now_vn()
+    now = datetime.now(VN_TZ)
     return WORK_START <= now.hour < WORK_END
 
 def _day_name_vi(d: datetime) -> str:
@@ -82,41 +91,38 @@ def _fmt_signal(sig: dict) -> str:
 def _macro_bias(event_title_en: str, actual: str, forecast: str, previous: str) -> str:
     t = (event_title_en or "").lower()
     def num(x):
-        try:
-            return float(str(x).replace('%','').replace(',','').strip())
-        except:
-            return None
+       try: 
+           return float(str(x).replace('%','').replace(',','').strip())
+       except: 
+           return None
     a, f, p = num(actual), num(forecast), num(previous)
 
-    if "cpi" in t or "pce" in t or "ppi" in t or "inflation" in t:
+    if any(k in t for k in ["cpi","pce","ppi","inflation"]):
         if a is not None and f is not None:
             return "✅ Risk-on (lạm phát thấp hơn dự báo)" if a < f else "⚠️ Risk-off (lạm phát cao hơn dự báo)"
         return "ℹ️ Theo dõi lạm phát: thấp → on, cao → off"
 
-    if "unemployment" in t or "jobless" in t:
+    if any(k in t for k in ["unemployment","jobless"]):
         if a is not None and f is not None:
             return "⚠️ Risk-off (thất nghiệp cao hơn dự báo)" if a > f else "✅ Risk-on (thất nghiệp thấp hơn dự báo)"
         return "ℹ️ Theo dõi thất nghiệp: cao → off, thấp → on"
 
-    if "non-farm" in t or "nfp" in t or "payrolls" in t:
+    if any(k in t for k in ["non-farm","nfp","payrolls"]):
         if a is not None and f is not None:
-            if a > 1.3 * f:
-                return "⚠️ Có thể Risk-off (quá nóng → Fed hawkish)"
-            elif a > f:
-                return "✅ Hơi Risk-on (việc làm tốt hơn dự báo)"
-            else:
-                return "⚠️ Hơi Risk-off (việc làm kém)"
+            if a > 1.3 * f: return "⚠️ Có thể Risk-off (quá nóng → Fed hawkish)"
+            if a > f:       return "✅ Hơi Risk-on (việc làm tốt hơn dự báo)"
+            return "⚠️ Hơi Risk-off (việc làm kém)"
         return "ℹ️ Theo dõi NFP: tốt vừa → on, quá nóng → off"
 
-    if "interest rate" in t or "fomc" in t or "rate decision" in t or "fed" in t:
+    if any(k in t for k in ["interest rate","fomc","rate decision","fed"]):
         if actual:
             at = actual.lower()
-            if "cut" in at: return "✅ Nghiêng Risk-on (cắt lãi)"
-            if "hike" in at or "+" in at: return "⚠️ Nghiêng Risk-off (tăng lãi)"
-            if "hold" in at or at == previous: return "ℹ️ Trung tính (giữ nguyên)"
+            if "cut" in at:                         return "✅ Nghiêng Risk-on (cắt lãi)"
+            if "hike" in at or "+" in at:           return "⚠️ Nghiêng Risk-off (tăng lãi)"
+            if "hold" in at or previous == actual:  return "ℹ️ Trung tính (giữ nguyên)"
         return "ℹ️ Chờ chi tiết quyết định & họp báo"
 
-    if "retail sales" in t or "pmi" in t or "ism" in t or "gdp" in t:
+    if any(k in t for k in ["retail sales","pmi","ism","gdp"]):
         if a is not None and f is not None:
             return "✅ Risk-on (số liệu tốt hơn)" if a > f else "⚠️ Risk-off (số liệu xấu hơn)"
         return "ℹ️ Số liệu tốt → on, xấu → off"
@@ -164,7 +170,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
 # ========= 07:00 — Lịch vĩ mô hôm nay =========
 async def job_macro(context: ContextTypes.DEFAULT_TYPE):
     events = await fetch_macro_today()
-    now = _now_vn()
+    now = datetime.now(VN_TZ)
     header = f"📅 {_day_name_vi(now)}, ngày {now.strftime('%d/%m/%Y')}"
     if not events:
         await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID,
@@ -242,7 +248,7 @@ async def job_halfhour_signals(context: ContextTypes.DEFAULT_TYPE):
                                            parse_mode="HTML")
             bump_signals(1)
 
-# ========= KHẨN (gộp 1 tin + pin/unpin + sticky ảo) =========
+# ========= KHẨN (siết mạnh: chỉ gửi khi có thể vào ngay) =========
 async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
     if not _in_work_hours(): return
     if not can_alert_this_hour(ALERT_PER_HOUR_MAX): return
@@ -255,72 +261,142 @@ async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
         for sym in syms:
             try:
                 mq = await quick_signal_metrics(session, sym, interval="5m")
-                vr = mq.get("vol_ratio") or 1.0
-                fd = abs(mq.get("funding") or 0.0)
-                if (fd < ALERT_FUNDING) and (vr < ALERT_VOLRATIO): continue
+                vr = float(mq.get("vol_ratio") or 1.0)
+                fd = abs(float(mq.get("funding") or 0.0))
 
+                # Sơ bộ
+                if (fd < ALERT_FUNDING) and (vr < ALERT_VOLRATIO): 
+                    continue
+
+                # Tính chi tiết
                 ret15m_abs, z_vol, abs_funding, m = await _calc_urgency_components(session, sym)
                 score = _urgent_score(ret15m_abs, z_vol, abs_funding)
-                if score < ALERT_SCORE_MIN: continue
 
+                # Rào cứng “rất tự tin”
+                if vr < URGENT_VOLRATIO_MIN or vr > URGENT_VOLRATIO_MAX: 
+                    continue
+                if abs_funding < URGENT_FUNDING_MIN: 
+                    continue
+
+                # Yêu cầu trend align
+                if URGENT_REQUIRE_TREND_ALIGN:
+                    last = float(m.get("last") or 0.0)
+                    ema50 = float(m.get("ema50") or last)
+                    ema200 = float(m.get("ema200") or last)
+                    trend_long  = last > ema50 > ema200
+                    trend_short = last < ema50 < ema200
+                    # nếu không rõ trend thì bỏ
+                    if not (trend_long or trend_short):
+                        continue
+
+                # Cooldown theo coin (trừ khi cực mạnh)
                 strong = (score >= ALERT_SCORE_STRONG) or (vr >= ALERT_STRONG_VOLRATIO)
-                if (not strong) and (not can_alert_symbol(sym, ALERT_COOLDOWN_MIN)): continue
+                if (not strong) and (not can_alert_symbol(sym, ALERT_COOLDOWN_MIN)):
+                    continue
 
-                scored.append({"symbol": sym, "score": score, "metrics": m, "strong": strong})
+                scored.append({"symbol": sym, "score": score, "metrics": m, "trend_long": trend_long if URGENT_REQUIRE_TREND_ALIGN else None})
             except Exception:
                 continue
 
         if not scored: return
+
         scored.sort(key=lambda x: x["score"], reverse=True)
         picks = scored[:min(ALERT_TOPK, ALERT_MAX_PER_RUN)]
 
-        board = _fmt_board(picks)
-        detail = ["", "⏰ TÍN HIỆU KHẨN (Chọn lọc)"]
+        # Lọc lần cuối bằng “khả năng vào ngay”: RR & trượt giá
+        final = []
         for it in picks:
             sym = it["symbol"]; m = it["metrics"]
-            s = await generate_signal(sym)
-            s["signal_type"] = "Swing (Khẩn)"; s["order_type"] = "Market"
-            s["funding"] = m.get("funding"); s["vol_ratio"] = m.get("vol_ratio")
+            try:
+                s = await generate_signal(sym)  # có entry/tp/sl/side/time/strength/...
+                last = float(m.get("last") or 0.0)
+                entry = float(s["entry"]); tp = float(s["tp"]); sl = float(s["sl"])
+                side = s["side"].upper()
+
+                # Kiểm trend cùng chiều lệnh
+                if URGENT_REQUIRE_TREND_ALIGN:
+                    tl = it["trend_long"]
+                    if (side == "LONG" and not tl) or (side == "SHORT" and tl):
+                        continue
+
+                # RR tối thiểu
+                if side == "LONG":
+                    rr = (tp - entry) / max(entry - sl, 1e-9)
+                else:
+                    rr = (entry - tp) / max(sl - entry, 1e-9)
+                if rr < URGENT_MIN_RR:
+                    continue
+
+                # Trượt giá so với giá hiện tại (vào được ngay)
+                if last > 0:
+                    slippage = abs(entry - last) / last
+                    if slippage > URGENT_ENTRY_SLIPPAGE_MAX:
+                        continue
+
+                # Nhúng info hiển thị
+                s["signal_type"] = "Swing (Khẩn)"
+                s["order_type"]  = "Market"
+                s["funding"]     = m.get("funding")
+                s["vol_ratio"]   = m.get("vol_ratio")
+
+                it["signal"] = s
+                final.append(it)
+            except Exception:
+                continue
+
+        if not final: 
+            return
+
+        # Chỉ gửi 1 tin “combo” + ghim mới, gỡ ghim cũ
+        final.sort(key=lambda x: x["score"], reverse=True)
+        top = final[:1]
+
+        board = _fmt_board(top)
+        detail_lines = ["", "⏰ TÍN HIỆU KHẨN (Vào được ngay)"]
+        for it in top:
+            s = it["signal"]; m = it["metrics"]
             side_hint = "Long nghiêng" if (m.get("funding") or 0) > 0 else ("Short nghiêng" if (m.get("funding") or 0) < 0 else "Trung tính")
-            guidance = f"\n💡 Gợi ý: ưu tiên {'MUA' if s['side']=='LONG' else 'BÁN'} nếu ổn định thêm ({side_hint})."
-            detail += ["", _fmt_signal(s) + guidance]
-            mark_alert_symbol(sym); bump_alerts(1); bump_alert_hour()
+            guidance = f"\n💡 Gợi ý: {'MUA ngay' if s['side']=='LONG' else 'BÁN ngay'} (đủ điều kiện vào tức thì) — {side_hint}."
+            detail_lines += ["", _fmt_signal(s) + guidance]
 
-        combo_text = "\n".join([board] + detail)
+            mark_alert_symbol(s["token"])
+            bump_alerts(1)
+            bump_alert_hour()
 
+        combo_text = "\n".join([board] + detail_lines)
+
+        # Gửi
         msg = await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=combo_text, parse_mode="HTML")
 
-        old_mid = get_sticky_message_id(); pinned_ok = False
+        # Pin mới, gỡ pin cũ
+        old_mid = get_sticky_message_id()
         if PIN_URGENT:
             try:
+                # unpin cũ trước (nếu có)
+                if old_mid and old_mid != msg.message_id:
+                    try:
+                        await context.bot.unpin_chat_message(chat_id=TELEGRAM_ALLOWED_USER_ID, message_id=old_mid)
+                    except Exception:
+                        pass
                 await context.bot.pin_chat_message(chat_id=TELEGRAM_ALLOWED_USER_ID, message_id=msg.message_id, disable_notification=True)
-                pinned_ok = True
+                set_sticky_message_id(msg.message_id)
             except Exception:
-                pinned_ok = False
-
-        if pinned_ok:
-            if old_mid and old_mid != msg.message_id:
-                try: await context.bot.unpin_chat_message(chat_id=TELEGRAM_ALLOWED_USER_ID, message_id=old_mid)
-                except Exception: pass
-            set_sticky_message_id(msg.message_id)
-        else:
-            try:
-                if old_mid:
-                    await context.bot.edit_message_text(chat_id=TELEGRAM_ALLOWED_USER_ID, message_id=old_mid, text=combo_text)
-                else:
-                    m2 = await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=combo_text, parse_mode="HTML")
-                    set_sticky_message_id(m2.message_id)
-            except Exception:
-                pass
+                # sticky ảo
+                try:
+                    if old_mid:
+                        await context.bot.edit_message_text(chat_id=TELEGRAM_ALLOWED_USER_ID, message_id=old_mid, text=combo_text)
+                    else:
+                        m2 = await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=combo_text, parse_mode="HTML")
+                        set_sticky_message_id(m2.message_id)
+                except Exception:
+                    pass
 
 # ========= PHÂN TÍCH LÚC RA TIN — TRƯỚC GIỜ =========
 async def job_macro_watch_pre(context: ContextTypes.DEFAULT_TYPE):
-    """Báo trước giờ ra tin 30', 15', 5' + snapshot BTC/ETH."""
     events = await fetch_macro_week()
     if not events: return
-    now = _now_vn()
-
-    checkpoints = [30, 15, 5]  # phút
+    now = datetime.now(VN_TZ)
+    checkpoints = [30, 15, 5]
     targets = []
     for e in events:
         delta_min = int((e["time_vn"] - now).total_seconds() // 60)
@@ -329,23 +405,18 @@ async def job_macro_watch_pre(context: ContextTypes.DEFAULT_TYPE):
                 key = f"{e['id']}@-{cp}"
                 if key not in _pre_announced:
                     targets.append((e, cp, key))
-
     if not targets: return
 
     async with aiohttp.ClientSession() as session:
         def fmt_snap(sym, m):
             return f"{sym}: funding {m.get('funding',0):.4f} | Vol5m x{(m.get('vol_ratio') or 1.0):.2f}"
-
         for e, cp, key in targets:
             try:
                 btc = await quick_signal_metrics(session, "BTCUSDT", interval="5m")
                 eth = await quick_signal_metrics(session, "ETHUSDT", interval="5m")
             except Exception:
                 btc = {}; eth = {}
-
-            bias = _macro_bias(e.get("title_en") or e.get("title") or "",
-                               e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
-
+            bias = _macro_bias(e.get("title") or "", e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
             lines = [
                 f"⏳ {cp} phút nữa ra tin: <b>{e['title_vi']}</b>",
                 f"🕒 Giờ VN: {e['time_vn'].strftime('%H:%M %d/%m')}",
@@ -355,33 +426,21 @@ async def job_macro_watch_pre(context: ContextTypes.DEFAULT_TYPE):
             if e.get("forecast"): extra.append(f"Dự báo: {e['forecast']}")
             if e.get("previous"): extra.append(f"Trước: {e['previous']}")
             if extra: lines.append(" — ".join(extra))
-            lines += [
-                "",
-                "📈 Snapshot thị trường:",
-                f"• {fmt_snap('BTC', btc)}",
-                f"• {fmt_snap('ETH', eth)}",
-                "",
-                f"🧭 Bias sơ bộ: {bias}",
-                "💡 Mẹo: Đứng ngoài 5–10’ quanh giờ ra tin; tránh FOMO nến đầu."
-            ]
+            lines += ["", "📈 Snapshot thị trường:", f"• {fmt_snap('BTC', btc)}", f"• {fmt_snap('ETH', eth)}", "", f"🧭 Bias sơ bộ: {bias}", "💡 Mẹo: Đứng ngoài 5–10’ quanh giờ ra tin; tránh FOMO nến đầu."]
             await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text="\n".join(lines), parse_mode="HTML")
             _pre_announced.add(key)
 
 # ========= PHÂN TÍCH LÚC RA TIN — SAU GIỜ =========
 async def job_macro_watch_post(context: ContextTypes.DEFAULT_TYPE):
-    """Sau tin (≤15’), nếu có 'actual' thì so sánh Actual vs Forecast/Previous + snapshot BTC/ETH + bias."""
     events = await fetch_macro_week()
     if not events: return
-    now = _now_vn()
-
+    now = datetime.now(VN_TZ)
     candidates = []
     for e in events:
         dtv = e["time_vn"]
         if 0 <= (now - dtv).total_seconds() <= 15*60:
-            if e.get("actual"):
-                if e["id"] not in _post_reported:
-                    candidates.append(e)
-
+            if e.get("actual") and e["id"] not in _post_reported:
+                candidates.append(e)
     if not candidates: return
 
     async with aiohttp.ClientSession() as session:
@@ -391,33 +450,20 @@ async def job_macro_watch_post(context: ContextTypes.DEFAULT_TYPE):
                 eth = await quick_signal_metrics(session, "ETHUSDT", interval="5m")
             except Exception:
                 btc = {}; eth = {}
-
-            bias = _macro_bias(e.get("title_en") or e.get("title") or "",
-                               e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
-
+            bias = _macro_bias(e.get("title") or "", e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
+            def fmt_snap(sym, m):
+                return f"{sym}: funding {m.get('funding',0):.4f} | Vol5m x{(m.get('vol_ratio') or 1.0):.2f}"
             lines = [
                 f"🛎️ <b>Kết quả vừa công bố:</b> {e['title_vi']}",
                 f"🕒 Giờ VN: {e['time_vn'].strftime('%H:%M %d/%m')}",
                 f"📊 Ảnh hưởng: {e['impact']}",
             ]
             trio = []
-            if e.get("actual"): trio.append(f"Thực tế: {e['actual']}")
+            if e.get("actual"):   trio.append(f"Thực tế: {e['actual']}")
             if e.get("forecast"): trio.append(f"Dự báo: {e['forecast']}")
             if e.get("previous"): trio.append(f"Trước: {e['previous']}")
             if trio: lines.append(" — ".join(trio))
-
-            def fmt_snap(sym, m):
-                return f"{sym}: funding {m.get('funding',0):.4f} | Vol5m x{(m.get('vol_ratio') or 1.0):.2f}"
-
-            lines += [
-                "",
-                "📈 Snapshot sau tin:",
-                f"• {fmt_snap('BTC', btc)}",
-                f"• {fmt_snap('ETH', eth)}",
-                "",
-                f"🧭 Đánh giá: {bias}",
-                "⚠️ Lưu ý: Nến đầu sau tin thường nhiễu; chờ xác nhận 1–3 nến."
-            ]
+            lines += ["", "📈 Snapshot sau tin:", f"• {fmt_snap('BTC', btc)}", f"• {fmt_snap('ETH', eth)}", "", f"🧭 Đánh giá: {bias}", "⚠️ Lưu ý: Nến đầu sau tin thường nhiễu; chờ xác nhận 1–3 nến."]
             await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text="\n".join(lines), parse_mode="HTML")
             _post_reported.add(e["id"])
 
@@ -433,24 +479,6 @@ async def job_night_summary(context: ContextTypes.DEFAULT_TYPE):
     )
     await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=text)
 
-# ========= HELPERS: CĂN GIỜ CỐ ĐỊNH THEO ĐỒNG HỒ =========
-def _next_at_minute(minute: int, second: int = 0) -> datetime:
-    """Trả về datetime (VN_TZ) lần kế tiếp ở phút=minute, giây=second."""
-    now = _now_vn()
-    cand = now.replace(minute=minute, second=second, microsecond=0)
-    if cand <= now:
-        cand += timedelta(hours=1)
-    return cand
-
-def _next_every_k_minutes(k: int, second: int = 0) -> datetime:
-    """Trả về datetime (VN_TZ) lần kế tiếp tại mốc phút bội số của k."""
-    now = _now_vn()
-    next_min = ((now.minute // k) + 1) * k
-    cand = now.replace(minute=0, second=second, microsecond=0) + timedelta(minutes=next_min, hours=0)
-    if cand <= now:
-        cand += timedelta(minutes=k)
-    return cand
-
 # ========= ĐĂNG KÝ JOB =========
 def setup_jobs(app: Application):
     jq = app.job_queue
@@ -460,18 +488,16 @@ def setup_jobs(app: Application):
         jq.start()
         app.job_queue = jq
 
-    # Hàng ngày theo giờ cố định
-    jq.run_daily(job_morning, time=dt.time(hour=6, minute=0, tzinfo=VN_TZ), name="morning_0600")
-    jq.run_daily(job_macro,   time=dt.time(hour=7, minute=0, tzinfo=VN_TZ), name="macro_0700")
+    jq.run_daily(job_morning,       time=dt.time(hour=6,  minute=0, tzinfo=VN_TZ), name="morning_0600")
+    jq.run_daily(job_macro,         time=dt.time(hour=7,  minute=0, tzinfo=VN_TZ), name="macro_0700")
+
+    jq.run_repeating(job_halfhour_signals, interval=1800, first=5,  name="signals_30m")
+
+    # Khẩn: 10 phút/lần, nhưng do bộ lọc siết mạnh nên sẽ rất hạn chế
+    jq.run_repeating(job_urgent_alerts,    interval=600,  first=15, name="alerts_10m")
+
+    # Phân tích lịch: 5 phút/lần
+    jq.run_repeating(job_macro_watch_pre,  interval=300,  first=20, name="macro_pre_5m")
+    jq.run_repeating(job_macro_watch_post, interval=300,  first=50, name="macro_post_5m")
+
     jq.run_daily(job_night_summary, time=dt.time(hour=22, minute=0, tzinfo=VN_TZ), name="summary_2200")
-
-    # Tín hiệu 30 phút — CHẠY ĐÚNG MỐC :00 và :30
-    jq.run_repeating(job_halfhour_signals, interval=3600, first=_next_at_minute(0, 0),  name="signals_at_00")
-    jq.run_repeating(job_halfhour_signals, interval=3600, first=_next_at_minute(30, 0), name="signals_at_30")
-
-    # Tin khẩn: 10 phút/lần, căn mốc phút % 10 == 0
-    jq.run_repeating(job_urgent_alerts, interval=600, first=_next_every_k_minutes(10, 0), name="alerts_10m")
-
-    # Phân tích lịch: 5 phút/lần, căn mốc phút % 5 == 0
-    jq.run_repeating(job_macro_watch_pre,  interval=300, first=_next_every_k_minutes(5, 0),  name="macro_pre_5m")
-    jq.run_repeating(job_macro_watch_post, interval=300, first=_next_every_k_minutes(5, 0),  name="macro_post_5m")
