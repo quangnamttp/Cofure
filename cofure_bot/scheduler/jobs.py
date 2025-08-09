@@ -32,7 +32,7 @@ ALERT_FUNDING   = 0.02          # |funding| >= 2‰
 ALERT_VOLRATIO  = 1.8           # bùng nổ volume >= x1.8 so với MA20
 
 # Cảnh báo khẩn - CHỌN LỌC & TẦN SUẤT
-ALERT_COOLDOWN_MIN   = 60       # mỗi symbol ít nhất 60' mới khẩn lại
+ALERT_COOLDOWN_MIN   = 180      # ⬅️ 3 tiếng/coin
 ALERT_TOPK           = 2        # lấy tối đa 2 symbol/lượt
 ALERT_MAX_PER_RUN    = 3        # chốt an toàn mỗi lượt quét
 ALERT_SCORE_MIN      = 3.0      # ngưỡng điểm tổng hợp tối thiểu
@@ -42,6 +42,9 @@ PIN_URGENT           = True     # cố gắng pin nếu có quyền
 # Bỏ cooldown nếu cực mạnh:
 ALERT_STRONG_VOLRATIO = 3.0     # vol_ratio >= 3.0
 ALERT_SCORE_STRONG    = 6.0     # score >= 6.0
+
+# Ngưỡng để gắn ⭐ cho lệnh định kỳ (gần mức khẩn)
+STAR_SCORE_THRESHOLD  = 5.0
 
 # ========= TIỆN ÍCH =========
 def _in_work_hours() -> bool:
@@ -90,17 +93,31 @@ def _fmt_signal(sig: dict) -> str:
 
 # ========= 06:00 — Chào buổi sáng (USD/VND + top gainers) =========
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
+    # Tỷ giá USD/VND với 2 nguồn (fallback)
     usd_vnd = None
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(
-                "https://api.exchangerate.host/latest",
-                params={"base": "USD", "symbols": "VND"},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    usd_vnd = float(data.get("rates", {}).get("VND") or 0) or None
+            # Nguồn 1
+            try:
+                async with s.get(
+                    "https://api.exchangerate.host/latest",
+                    params={"base": "USD", "symbols": "VND"},
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        usd_vnd = float(data.get("rates", {}).get("VND") or 0) or None
+            except Exception:
+                pass
+            # Nguồn 2 (fallback)
+            if not usd_vnd:
+                async with s.get(
+                    "https://open.er-api.com/v6/latest/USD",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as r2:
+                    if r2.status == 200:
+                        data2 = await r2.json()
+                        usd_vnd = float(data2.get("rates", {}).get("VND") or 0) or None
     except Exception:
         usd_vnd = None
 
@@ -156,22 +173,6 @@ async def job_macro(context: ContextTypes.DEFAULT_TYPE):
     lines.append("\n💡 Gợi ý: Đứng ngoài 5–10’ quanh giờ ra tin; quan sát funding/volume.")
     await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text="\n".join(lines))
 
-# ========= 06:00→22:00 — 30' gửi 5 tín hiệu =========
-async def job_halfhour_signals(context: ContextTypes.DEFAULT_TYPE):
-    if not _in_work_hours():
-        return
-    async with aiohttp.ClientSession() as session:
-        syms = await active_symbols(session, min_quote_volume=MIN_QUOTE_VOL)
-    if not syms:
-        syms = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]
-    candidates = syms[:MAX_CANDIDATES]
-    signals = await generate_batch(candidates, count=5)
-    for i, s in enumerate(signals):
-        s["signal_type"] = "Scalping" if i < 3 else "Swing"
-        s["order_type"] = "Market"
-        await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=_fmt_signal(s))
-        bump_signals(1)
-
 # ========= TÍNH ĐIỂM KHẨN =========
 async def _calc_urgency_components(session, symbol: str):
     """
@@ -209,6 +210,43 @@ def _fmt_sticky_block(items):
         )
     lines.append("💡 Gợi ý: Ưu tiên theo dõi top score; chờ ổn định 1–3 nến trước khi vào.")
     return "\n".join(lines)
+
+# ========= 06:00→22:00 — 30' gửi 5 tín hiệu (gắn ⭐ nếu gần khẩn) =========
+async def job_halfhour_signals(context: ContextTypes.DEFAULT_TYPE):
+    if not _in_work_hours():
+        return
+    async with aiohttp.ClientSession() as session:
+        syms = await active_symbols(session, min_quote_volume=MIN_QUOTE_VOL)
+    if not syms:
+        syms = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]
+
+    candidates = syms[:MAX_CANDIDATES]
+    signals = await generate_batch(candidates, count=5)
+
+    # Gắn sao ⭐ nếu gần mức khẩn
+    async with aiohttp.ClientSession() as session:
+        for i, s in enumerate(signals):
+            s["signal_type"] = "Scalping" if i < 3 else "Swing"
+            s["order_type"]  = "Market"
+
+            star = ""
+            try:
+                ret15m_abs, z_vol, abs_funding, m = await _calc_urgency_components(session, s["token"])
+                score = _urgent_score(ret15m_abs, z_vol, abs_funding)
+                # nhúng info để hiển thị trong “Lý do”
+                s["funding"]   = m.get("funding")
+                s["vol_ratio"] = m.get("vol_ratio")
+                if score >= STAR_SCORE_THRESHOLD:
+                    star = "⭐ <b>Tín hiệu nổi bật</b>\n\n"
+            except Exception:
+                pass
+
+            await context.bot.send_message(
+                chat_id=TELEGRAM_ALLOWED_USER_ID,
+                text=(star + _fmt_signal(s)),
+                parse_mode="HTML"
+            )
+            bump_signals(1)
 
 # ========= 06:00→22:00 — 5' TIN KHẨN (chọn lọc + ghim + cooldown & bypass) =========
 async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
