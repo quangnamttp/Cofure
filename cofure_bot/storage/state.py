@@ -1,6 +1,5 @@
 # cofure_bot/storage/state.py
-
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 from cofure_bot.config import TZ_NAME
 
@@ -10,14 +9,15 @@ _state = {
     "signals_sent": 0,
     "alerts_sent": 0,
     "last_alert_symbol_at": {},   # {symbol: datetime}
-    "last_sticky_message_id": None,  # int | None
     "last_alert_hour_count": {},  # {"YYYYmmddHH": int}
+    "last_sticky_message_id": None,  # int|None (cho private chat)
 }
 
-def bump_signals(n=1):
+# ===== Counters =====
+def bump_signals(n: int = 1):
     _state["signals_sent"] += n
 
-def bump_alerts(n=1):
+def bump_alerts(n: int = 1):
     _state["alerts_sent"] += n
 
 def snapshot():
@@ -26,28 +26,30 @@ def snapshot():
         "alerts_sent": _state["alerts_sent"],
     }
 
-# === Urgent helpers ===
+# ===== Cooldown per symbol =====
 def can_alert_symbol(symbol: str, cooldown_minutes: int) -> bool:
-    t = _state["last_alert_symbol_at"].get(symbol)
-    if not t:
+    last = _state["last_alert_symbol_at"].get(symbol)
+    if not last:
         return True
     now = datetime.now(VN_TZ)
-    return (now - t).total_seconds() >= cooldown_minutes * 60
+    return (now - last).total_seconds() >= cooldown_minutes * 60
 
 def mark_alert_symbol(symbol: str):
     _state["last_alert_symbol_at"][symbol] = datetime.now(VN_TZ)
 
+# ===== Hourly cap =====
+def _hour_key() -> str:
+    return datetime.now(VN_TZ).strftime("%Y%m%d%H")
+
 def can_alert_this_hour(max_per_hour: int) -> bool:
-    now = datetime.now(VN_TZ)
-    key = now.strftime("%Y%m%d%H")
-    count = _state["last_alert_hour_count"].get(key, 0)
-    return count < max_per_hour
+    key = _hour_key()
+    return _state["last_alert_hour_count"].get(key, 0) < max_per_hour
 
 def bump_alert_hour():
-    now = datetime.now(VN_TZ)
-    key = now.strftime("%Y%m%d%H")
+    key = _hour_key()
     _state["last_alert_hour_count"][key] = _state["last_alert_hour_count"].get(key, 0) + 1
 
+# ===== Sticky message (private chat) =====
 def get_sticky_message_id():
     return _state["last_sticky_message_id"]
 
