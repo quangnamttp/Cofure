@@ -43,7 +43,7 @@ STAR_SCORE_THRESHOLD  = 5.0
 
 # ====== CACHE đơn giản cho phân tích lịch ======
 _pre_announced = set()   # id + marker từng mốc (id@-30, id@-15, id@-05)
-_post_reported  = set()   # id đã báo sau tin
+_post_reported  = set()  # id đã báo sau tin
 
 # ========= TIỆN ÍCH =========
 def _in_work_hours() -> bool:
@@ -78,18 +78,14 @@ def _fmt_signal(sig: dict) -> str:
 # ====== Heuristic bias theo loại tin ======
 def _macro_bias(event_title_en: str, actual: str, forecast: str, previous: str) -> str:
     """
-    Trả về gợi ý bias chung cho crypto (risk-on/risk-off).
-    - CPI/PCE/PPI: actual < forecast -> risk-on; > forecast -> risk-off
-    - Unemployment: actual > forecast -> risk-off
-    - NFP: actual >> forecast -> risk-on (độ mạnh kinh tế), nhưng nếu quá “nóng” có thể risk-off do Fed hawkish (đơn giản hoá: > forecast chút: on; quá cao > forecast*1.3: off)
-    - Rate/FOMC: 'cut' gợi on (tuỳ bối cảnh), 'hike' gợi off; nếu “hold” nhìn dot plot/statement (không có ở feed) => neutral
+    Gợi ý bias chung cho crypto (risk-on/risk-off) dựa vào loại tin & Actual vs Forecast.
     """
     t = (event_title_en or "").lower()
     def num(x):
-       try: 
-           return float(str(x).replace('%','').replace(',','').strip())
-       except: 
-           return None
+        try:
+            return float(str(x).replace('%','').replace(',','').strip())
+        except:
+            return None
 
     a, f, p = num(actual), num(forecast), num(previous)
 
@@ -323,37 +319,37 @@ async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
 
 # ========= PHÂN TÍCH LÚC RA TIN — TRƯỚC GIỜ =========
 async def job_macro_watch_pre(context: ContextTypes.DEFAULT_TYPE):
-    """Báo trước giờ ra tin 30', 15', 5' + snapshot BTC/ETH."""
+    """Báo trước giờ ra tin 30', 15', 5' + snapshot BTC/ETH (dung sai ±2')."""
     events = await fetch_macro_week()
     if not events: return
     now = datetime.now(VN_TZ)
 
-    # mốc cảnh báo (phải trùng gần chính xác để không spam)
     checkpoints = [30, 15, 5]  # phút
     targets = []
     for e in events:
-        # chỉ nhắc sự kiện High hoặc có từ khoá IMPORTANT (đã lọc ở fetch)
-        delta_min = int((e["time_vn"] - now).total_seconds() // 60)
+        dt_ev = e["time_vn"]
+        delta_min = int((dt_ev - now).total_seconds() // 60)
+        if delta_min < 0:
+            continue
         for cp in checkpoints:
-            if delta_min == cp:
+            # chạy mỗi 5', cho phép dung sai ±2'
+            if abs(delta_min - cp) <= 2:
                 key = f"{e['id']}@-{cp}"
                 if key not in _pre_announced:
                     targets.append((e, cp, key))
-
     if not targets: return
 
     async with aiohttp.ClientSession() as session:
         def fmt_snap(sym, m):
             return f"{sym}: funding {m.get('funding',0):.4f} | Vol5m x{(m.get('vol_ratio') or 1.0):.2f}"
-
         for e, cp, key in targets:
             try:
                 btc = await quick_signal_metrics(session, "BTCUSDT", interval="5m")
                 eth = await quick_signal_metrics(session, "ETHUSDT", interval="5m")
             except Exception:
                 btc = {}; eth = {}
-            # gợi ý bias sơ bộ (chưa có actual)
-            bias = _macro_bias(e.get("title") or "", e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
+            # dùng title_en để bias chuẩn
+            bias = _macro_bias(e.get("title_en") or "", e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
 
             lines = [
                 f"⏳ {cp} phút nữa ra tin: <b>{e['title_vi']}</b>",
@@ -385,12 +381,11 @@ async def job_macro_watch_post(context: ContextTypes.DEFAULT_TYPE):
 
     candidates = []
     for e in events:
-        dt = e["time_vn"]
-        if 0 <= (now - dt).total_seconds() <= 15*60:  # trong 15 phút sau tin
-            if e.get("actual"):
-                if e["id"] not in _post_reported:
-                    candidates.append(e)
-
+        dt_ev = e["time_vn"]
+        secs = (now - dt_ev).total_seconds()
+        if 0 <= secs <= 15*60:
+            if e.get("actual") and e["id"] not in _post_reported:
+                candidates.append(e)
     if not candidates: return
 
     async with aiohttp.ClientSession() as session:
@@ -401,7 +396,7 @@ async def job_macro_watch_post(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 btc = {}; eth = {}
 
-            bias = _macro_bias(e.get("title") or "", e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
+            bias = _macro_bias(e.get("title_en") or "", e.get("actual") or "", e.get("forecast") or "", e.get("previous") or "")
 
             lines = [
                 f"🛎️ <b>Kết quả vừa công bố:</b> {e['title_vi']}",
@@ -458,7 +453,7 @@ def setup_jobs(app: Application):
     # Tin khẩn: 10 phút/lần (đã có cooldown 3h/coin + cap 3 tin/giờ)
     jq.run_repeating(job_urgent_alerts,    interval=600,  first=15, name="alerts_10m")
 
-    # Phân tích lịch: 5 phút/lần
+    # Phân tích lịch: 5 phút/lần (dung sai ±2' trong job_macro_watch_pre)
     jq.run_repeating(job_macro_watch_pre,  interval=300,  first=20, name="macro_pre_5m")
     jq.run_repeating(job_macro_watch_post, interval=300,  first=50, name="macro_post_5m")
 
