@@ -1,3 +1,5 @@
+# cofure_bot/scheduler/jobs.py
+
 import aiohttp
 import datetime as dt
 from datetime import datetime
@@ -8,25 +10,56 @@ from cofure_bot.config import TELEGRAM_ALLOWED_USER_ID, TZ_NAME
 from cofure_bot.signals.engine import generate_batch, generate_signal
 from cofure_bot.data.binance_client import active_symbols, top_gainers, quick_signal_metrics
 from cofure_bot.data.macro_calendar import fetch_macro_today
-from cofure_bot.storage.state import bump_signals, bump_alerts, snapshot
+from cofure_bot.storage.state import (
+    bump_signals, bump_alerts, snapshot,
+    can_alert_symbol, mark_alert_symbol,
+    can_alert_this_hour, bump_alert_hour,
+    get_sticky_message_id, set_sticky_message_id,
+)
 
 VN_TZ = pytz.timezone(TZ_NAME)
 
-# Ngưỡng & cấu hình
-MIN_QUOTE_VOL = 5_000_000.0   # lọc cặp volume >= 5 triệu USDT/24h
-MAX_CANDIDATES = 60           # giới hạn số symbol đem đi tính
-ALERT_MAX_PER_RUN = 3         # tối đa 3 cảnh báo mỗi lần quét
-ALERT_FUNDING   = 0.02        # |funding| >= 2‰
-ALERT_VOLRATIO  = 1.8         # bùng nổ volume >= x1.8 so với MA20
-WORK_START = 6
-WORK_END   = 22
+# ========= NGƯỠNG & CẤU HÌNH =========
+MIN_QUOTE_VOL   = 5_000_000.0   # lọc cặp volume >= 5 triệu USDT/24h
+MAX_CANDIDATES  = 60            # giới hạn số symbol đem đi tính
 
+# Tín hiệu định kỳ
+WORK_START      = 6
+WORK_END        = 22
+
+# Cảnh báo khẩn - NGƯỠNG CƠ BẢN (lọc sơ bộ)
+ALERT_FUNDING   = 0.02          # |funding| >= 2‰
+ALERT_VOLRATIO  = 1.8           # bùng nổ volume >= x1.8 so với MA20
+
+# Cảnh báo khẩn - CHỌN LỌC & TẦN SUẤT
+ALERT_COOLDOWN_MIN   = 60       # mỗi symbol ít nhất 60' mới khẩn lại
+ALERT_TOPK           = 2        # lấy tối đa 2 symbol/lượt
+ALERT_MAX_PER_RUN    = 3        # chốt an toàn mỗi lượt quét
+ALERT_SCORE_MIN      = 3.0      # ngưỡng điểm tổng hợp tối thiểu
+ALERT_PER_HOUR_MAX   = 3        # mỗi giờ tối đa 3 tin khẩn
+PIN_URGENT           = True     # cố gắng pin nếu có quyền
+
+# Bỏ cooldown nếu cực mạnh:
+ALERT_STRONG_VOLRATIO = 3.0     # vol_ratio >= 3.0
+ALERT_SCORE_STRONG    = 6.0     # score >= 6.0
+
+# ========= TIỆN ÍCH =========
 def _in_work_hours() -> bool:
     now = datetime.now(VN_TZ)
     return WORK_START <= now.hour < WORK_END
 
+def _day_name_vi(d: datetime) -> str:
+    return {
+        1: "Thứ 2",
+        2: "Thứ 3",
+        3: "Thứ 4",
+        4: "Thứ 5",
+        5: "Thứ 6",
+        6: "Thứ 7",
+        7: "Chủ nhật",
+    }[d.isoweekday()]
+
 def _fmt_signal(sig: dict) -> str:
-    """Format tin nhắn lệnh cho Telegram (linh hoạt thêm lý do Funding/Vol5m nếu có)."""
     label = "Mạnh" if sig["strength"] >= 70 else ("Tiêu chuẩn" if sig["strength"] >= 50 else "Tham khảo")
     side_square = "🟩" if sig["side"] == "LONG" else "🟥"
 
@@ -55,9 +88,8 @@ def _fmt_signal(sig: dict) -> str:
         f"🕒 Thời gian: {sig['time']}"
     )
 
-# === 06:00 — Chào buổi sáng + top gainers + USD/VND ===
+# ========= 06:00 — Chào buổi sáng (USD/VND + top gainers) =========
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
-    # 1) Lấy tỷ giá USD/VND (fallback nếu lỗi)
     usd_vnd = None
     try:
         async with aiohttp.ClientSession() as s:
@@ -72,11 +104,9 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         usd_vnd = None
 
-    # 2) Top 5 tăng trưởng
     async with aiohttp.ClientSession() as session:
         gainers = await top_gainers(session, 5)
 
-    # 3) Soạn tin
     if usd_vnd:
         lines = [f"Chào buổi sáng nhé Cofure ☀️  (1 USD ≈ {usd_vnd:,.0f} VND)", ""]
     else:
@@ -90,7 +120,6 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
     lines.append("")
     lines.append("📊 Funding, volume, xu hướng sẽ có trong tín hiệu định kỳ suốt ngày.")
 
-    # 4) Gửi
     await context.bot.send_message(
         chat_id=TELEGRAM_ALLOWED_USER_ID,
         text="\n".join(lines),
@@ -98,13 +127,16 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True
     )
 
-# === 07:00 — Lịch vĩ mô hôm nay ===
+# ========= 07:00 — Lịch vĩ mô hôm nay =========
 async def job_macro(context: ContextTypes.DEFAULT_TYPE):
     events = await fetch_macro_today()
     now = datetime.now(VN_TZ)
-    header = f"📅 Hôm nay là Thứ {now.isoweekday()}, ngày {now.strftime('%d/%m/%Y')}"
+    header = f"📅 {_day_name_vi(now)}, ngày {now.strftime('%d/%m/%Y')}"
     if not events:
-        await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=header + "\n\nHôm nay không có tin tức vĩ mô quan trọng.\nChúc bạn một ngày trade thật thành công nha!")
+        await context.bot.send_message(
+            chat_id=TELEGRAM_ALLOWED_USER_ID,
+            text=header + "\n\nHôm nay không có tin tức vĩ mô quan trọng.\nChúc bạn một ngày trade thật thành công nha!"
+        )
         return
     lines = [header, "", "🧭 Lịch tin vĩ mô quan trọng:"]
     for e in events:
@@ -124,7 +156,7 @@ async def job_macro(context: ContextTypes.DEFAULT_TYPE):
     lines.append("\n💡 Gợi ý: Đứng ngoài 5–10’ quanh giờ ra tin; quan sát funding/volume.")
     await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text="\n".join(lines))
 
-# === 06:00→22:00 — Mỗi 30' gửi 5 tín hiệu RIÊNG LẺ ===
+# ========= 06:00→22:00 — 30' gửi 5 tín hiệu =========
 async def job_halfhour_signals(context: ContextTypes.DEFAULT_TYPE):
     if not _in_work_hours():
         return
@@ -140,40 +172,137 @@ async def job_halfhour_signals(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=_fmt_signal(s))
         bump_signals(1)
 
-# === 06:00→22:00 — Mỗi 5' cảnh báo khẩn (phát lệnh đẹp) ===
+# ========= TÍNH ĐIỂM KHẨN =========
+async def _calc_urgency_components(session, symbol: str):
+    """
+    Trả về: (ret15m_abs, z_vol, abs_funding, metrics)
+    metrics: last, rsi, ema50, ema200, trend, vol_ratio, funding
+    """
+    m = await quick_signal_metrics(session, symbol, interval="5m")
+    last = m.get("last") or 0.0
+    ema9  = m.get("ema50") or last
+    ema21 = m.get("ema200") or last
+    if last:
+        ret15m_abs = abs((ema9 - ema21) / last) * 100.0
+    else:
+        ret15m_abs = 0.0
+
+    vol_ratio = m.get("vol_ratio") or 1.0
+    z_vol = max(0.0, vol_ratio - 1.0)  # độ lệch trên MA
+    abs_funding = abs(m.get("funding") or 0.0)
+    return ret15m_abs, z_vol, abs_funding, m
+
+def _urgent_score(ret15m_abs, z_vol, abs_funding):
+    # trọng số: volume bất thường > biến động giá > funding lệch
+    return 1.0 * z_vol + 0.6 * ret15m_abs + 40.0 * abs_funding
+
+def _fmt_sticky_block(items):
+    lines = ["🔴 BẢNG CẢNH BÁO KHẨN (Cập nhật)"]
+    for it in items:
+        sym = it["symbol"]
+        score = it["score"]
+        m = it["metrics"]
+        arrow = "▲" if (m.get("vol_ratio") or 1.0) >= 1.8 else ""
+        side_hint = "Long nghiêng" if (m.get("funding") or 0) > 0 else ("Short nghiêng" if (m.get("funding") or 0) < 0 else "Trung tính")
+        lines.append(
+            f"• {sym} | score {score:.2f} | Vol5m x{(m.get('vol_ratio') or 1.0):.2f}{arrow} | Funding {m.get('funding',0):.4f} ({side_hint})"
+        )
+    lines.append("💡 Gợi ý: Ưu tiên theo dõi top score; chờ ổn định 1–3 nến trước khi vào.")
+    return "\n".join(lines)
+
+# ========= 06:00→22:00 — 5' TIN KHẨN (chọn lọc + ghim + cooldown & bypass) =========
 async def job_urgent_alerts(context: ContextTypes.DEFAULT_TYPE):
     if not _in_work_hours():
         return
-    alerts = 0
+
+    # hard cap theo giờ
+    if not can_alert_this_hour(ALERT_PER_HOUR_MAX):
+        return
+
     async with aiohttp.ClientSession() as session:
         syms = await active_symbols(session, min_quote_volume=MIN_QUOTE_VOL)
-        for sym in syms[:MAX_CANDIDATES]:
-            try:
-                m = await quick_signal_metrics(session, sym, interval="5m")
+        syms = syms[:MAX_CANDIDATES] if syms else ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]
 
-                if (abs(m["funding"]) < ALERT_FUNDING) and (m["vol_ratio"] < ALERT_VOLRATIO):
+        scored = []
+        for sym in syms:
+            try:
+                # lọc sơ bộ nhanh
+                m_quick = await quick_signal_metrics(session, sym, interval="5m")
+                vr = m_quick.get("vol_ratio") or 1.0
+                fd = abs(m_quick.get("funding") or 0.0)
+                if (fd < ALERT_FUNDING) and (vr < ALERT_VOLRATIO):
                     continue
 
-                s = await generate_signal(sym)   # side/entry/tp/sl/strength/rsi/ema9/ema21/time
-                s["signal_type"] = "Swing (Khẩn)"
-                s["order_type"]  = "Market"
-                s["funding"]     = m["funding"]
-                s["vol_ratio"]   = m["vol_ratio"]
+                # tính điểm chi tiết
+                ret15m_abs, z_vol, abs_funding, m = await _calc_urgency_components(session, sym)
+                score = _urgent_score(ret15m_abs, z_vol, abs_funding)
+                if score < ALERT_SCORE_MIN:
+                    continue
 
-                side_hint = "Long nghiêng" if m["funding"] > 0 else ("Short nghiêng" if m["funding"] < 0 else "Trung tính")
-                guidance = f"\n💡 Gợi ý: ưu tiên {'MUA' if s['side']=='LONG' else 'BÁN'} nếu ổn định thêm ({side_hint})."
+                strong = (score >= ALERT_SCORE_STRONG) or (vr >= ALERT_STRONG_VOLRATIO)
 
-                text = "⏰ TÍN HIỆU KHẨN\n\n" + _fmt_signal(s) + guidance
-                await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=text)
-                bump_alerts(1)
+                # nếu không cực mạnh thì áp cooldown; cực mạnh được phép bypass cooldown (để lặp lại)
+                if (not strong) and (not can_alert_symbol(sym, ALERT_COOLDOWN_MIN)):
+                    continue
 
-                alerts += 1
-                if alerts >= ALERT_MAX_PER_RUN:
-                    break
+                scored.append({"symbol": sym, "score": score, "metrics": m, "strong": strong})
             except Exception:
                 continue
 
-# === 22:00 — Tổng kết phiên ===
+        if not scored:
+            return
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        picks = scored[:min(ALERT_TOPK, ALERT_MAX_PER_RUN)]
+
+        sent = 0
+        sticky_items = []
+        for it in picks:
+            sym = it["symbol"]
+            m = it["metrics"]
+
+            # tạo lệnh đẹp (khẩn) bằng engine
+            s = await generate_signal(sym)
+            s["signal_type"] = "Swing (Khẩn)"
+            s["order_type"]  = "Market"
+            s["funding"]     = m.get("funding")
+            s["vol_ratio"]   = m.get("vol_ratio")
+
+            side_hint = "Long nghiêng" if (m.get("funding") or 0) > 0 else ("Short nghiêng" if (m.get("funding") or 0) < 0 else "Trung tính")
+            guidance = f"\n💡 Gợi ý: ưu tiên {'MUA' if s['side']=='LONG' else 'BÁN'} nếu ổn định thêm ({side_hint})."
+
+            text = "⏰ TÍN HIỆU KHẨN (Chọn lọc)\n\n" + _fmt_signal(s) + guidance
+            msg = await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=text)
+
+            # ghim nếu có thể (group/supergroup + quyền pin); private chat sẽ fail -> sticky ảo
+            if PIN_URGENT:
+                try:
+                    await context.bot.pin_chat_message(chat_id=TELEGRAM_ALLOWED_USER_ID, message_id=msg.message_id, disable_notification=True)
+                except Exception:
+                    pass
+
+            mark_alert_symbol(sym)
+            bump_alerts(1)
+            bump_alert_hour()
+            sent += 1
+            sticky_items.append(it)
+
+            if sent >= ALERT_MAX_PER_RUN:
+                break
+
+        # Sticky ảo cho private chat: cập nhật 1 message cố định
+        try:
+            sticky_mid = get_sticky_message_id()
+            sticky_text = _fmt_sticky_block(sticky_items)
+            if sticky_mid:
+                await context.bot.edit_message_text(chat_id=TELEGRAM_ALLOWED_USER_ID, message_id=sticky_mid, text=sticky_text)
+            else:
+                m2 = await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=sticky_text)
+                set_sticky_message_id(m2.message_id)
+        except Exception:
+            pass
+
+# ========= 22:00 — Tổng kết =========
 async def job_night_summary(context: ContextTypes.DEFAULT_TYPE):
     snap = snapshot()
     text = (
@@ -185,8 +314,8 @@ async def job_night_summary(context: ContextTypes.DEFAULT_TYPE):
     )
     await context.bot.send_message(chat_id=TELEGRAM_ALLOWED_USER_ID, text=text)
 
+# ========= ĐĂNG KÝ JOB =========
 def setup_jobs(app: Application):
-    # Đảm bảo JobQueue tồn tại (webhook mode)
     jq = app.job_queue
     if jq is None:
         jq = JobQueue()
@@ -194,9 +323,8 @@ def setup_jobs(app: Application):
         jq.start()
         app.job_queue = jq
 
-    # Lịch cố định theo giờ VN
     jq.run_daily(job_morning,       time=dt.time(hour=6,  minute=0, tzinfo=VN_TZ), name="morning_0600")
     jq.run_daily(job_macro,         time=dt.time(hour=7,  minute=0, tzinfo=VN_TZ), name="macro_0700")
-    jq.run_repeating(job_halfhour_signals, interval=1800, first=5,  name="signals_30m")   # mỗi 30'
-    jq.run_repeating(job_urgent_alerts,    interval=300,  first=15, name="alerts_5m")     # mỗi 5'
+    jq.run_repeating(job_halfhour_signals, interval=1800, first=5,  name="signals_30m")
+    jq.run_repeating(job_urgent_alerts,    interval=300,  first=15, name="alerts_5m")
     jq.run_daily(job_night_summary, time=dt.time(hour=22, minute=0, tzinfo=VN_TZ), name="summary_2200")
